@@ -1,31 +1,33 @@
+import fs from "fs";
+import path from "path";
 import { chromium, devices } from "playwright";
 import { supabase } from "./supabase.js";
 
 /**
- * Versão atualizada do scraper.mjs
- * - Reinicia o browser mid-run em dois gatilhos configuráveis:
- *   * RESTART_AT_PERCENT: reinicia quando processou >= X% do total
- *   * RESTART_ON_CONSEC_FAILS: reinicia se houver N falhas consecutivas
- * - Rotaciona dispositivos Playwright + user-agents por contexto
- * - Fisher–Yates shuffle para embaralhamento
- * - Variáveis configuráveis via ENV: PARALLEL, WAIT_TIME, RESTART_AT_PERCENT, RESTART_ON_CONSEC_FAILS, RESTART_BACKOFF_MS, PROCESS_LIMIT
+ * scraper.mjs
+ * - Sharding via TOTAL_BATCHES / BATCH_ID
+ * - Claim atômico (status_updated is null OR 'pending') antes de processar
+ * - Debug saving (HTML + PNG) em caso de falha
+ * - Rotação de devices + user-agents por contexto
  *
- * Uso (exemplos):
- *  PARALLEL=5 RESTART_AT_PERCENT=50 RESTART_ON_CONSEC_FAILS=8 node scraper.mjs
+ * ENV supported:
+ *  - TOTAL_BATCHES (default 1)
+ *  - BATCH_ID (1..TOTAL_BATCHES, default 1)
+ *  - PROCESS_LIMIT (optional)
+ *  - PARALLEL (default 5)
+ *  - WAIT_TIME (ms) default 7000
+ *  - NAV_TIMEOUT (ms) default 60000
  */
 
-// ===== Configurações (podem vir do env) =====
-const PARALLEL = parseInt(process.env.PARALLEL || "5", 10);
+const TOTAL_BATCHES = Math.max(1, parseInt(process.env.TOTAL_BATCHES || "1", 10));
+const BATCH_ID = Math.max(1, parseInt(process.env.BATCH_ID || "1", 10)); // 1-based
+const PROCESS_LIMIT = process.env.PROCESS_LIMIT ? parseInt(process.env.PROCESS_LIMIT, 10) : null;
+const PARALLEL = Math.max(1, parseInt(process.env.PARALLEL || "5", 10));
 const WAIT_TIME = parseInt(process.env.WAIT_TIME || "7000", 10);
-const MAX_RETRIES = parseInt(process.env.MAX_RETRIES || "2", 10);
 const NAV_TIMEOUT = parseInt(process.env.NAV_TIMEOUT || "60000", 10);
 
-const RESTART_AT_PERCENT = parseInt(process.env.RESTART_AT_PERCENT || "50", 10); // reiniciar quando processar >= X%
-const RESTART_ON_CONSEC_FAILS = parseInt(process.env.RESTART_ON_CONSEC_FAILS || "8", 10); // reiniciar se N falhas consecutivas
-const RESTART_BACKOFF_MS = parseInt(process.env.RESTART_BACKOFF_MS || "10000", 10); // pausa entre fechar/abrir browser
-const PROCESS_LIMIT = process.env.PROCESS_LIMIT ? parseInt(process.env.PROCESS_LIMIT, 10) : null;
+const DEBUG_DIR = process.env.DEBUG_DIR || "./debug";
 
-// ===== Pool de devices e user-agents =====
 const DEVICE_NAMES = [
   "iPhone 13 Pro Max",
   "iPhone 12",
@@ -41,28 +43,26 @@ const DEVICE_NAMES = [
 const DEVICE_POOL = DEVICE_NAMES.map((n) => devices[n]).filter(Boolean);
 
 const USER_AGENTS = [
-  // mobile-first realistic UAs + some desktop fallback
   "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
-  "Mozilla/5.0 (iPhone; CPU iPhone OS 16_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.4 Mobile/15E148 Safari/604.1",
   "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
   "Mozilla/5.0 (Linux; Android 12; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Mobile Safari/537.36",
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_2_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15",
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
 ];
 
-// ===== Helpers utilitários =====
+// Helpers
+function ensureDebugDir() {
+  if (!fs.existsSync(DEBUG_DIR)) fs.mkdirSync(DEBUG_DIR, { recursive: true });
+}
+function nowTs() {
+  return new Date().toISOString().replace(/[:.]/g, "-");
+}
 function sleep(ms) {
   return new Promise((res) => setTimeout(res, ms));
 }
-
-function randomBetween(min, max) {
-  return Math.floor(Math.random() * (max - min + 1) + min);
+function jitter(ms) {
+  return Math.floor(Math.random() * ms);
 }
-
-function randomDelay(min = 1500, max = 3500) {
-  return sleep(randomBetween(min, max));
-}
-
 function fisherYatesShuffle(array) {
   const a = array.slice();
   for (let i = a.length - 1; i > 0; i--) {
@@ -71,91 +71,128 @@ function fisherYatesShuffle(array) {
   }
   return a;
 }
-
 function pickDeviceAndUA(index) {
-  const device = DEVICE_POOL.length ? DEVICE_POOL[index % DEVICE_POOL.length] : {};
+  const device = DEVICE_POOL[index % DEVICE_POOL.length] || {};
   const ua = USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
   return { device, ua };
 }
+async function saveDebug(page, offerId, note) {
+  try {
+    ensureDebugDir();
+    const ts = nowTs();
+    const safe = `offer-${offerId}-${ts}`;
+    const htmlPath = path.join(DEBUG_DIR, `${safe}.html`);
+    const pngPath = path.join(DEBUG_DIR, `${safe}.png`);
+    const content = await page.content();
+    await fs.promises.writeFile(htmlPath, `<!-- ${note} -->\n` + content, "utf8");
+    await page.screenshot({ path: pngPath, fullPage: true }).catch(() => {});
+    console.log(`🧾 Debug salvo: ${htmlPath} , ${pngPath}`);
+    return { htmlPath, pngPath };
+  } catch (err) {
+    console.warn("❌ Falha ao salvar debug:", err?.message || err);
+    return {};
+  }
+}
 
-// ===== Main =====
+// Claim helper: attempt atomic claim (status_updated IS NULL OR 'pending')
+async function tryClaimOffer(offerId) {
+  try {
+    const now = new Date().toISOString();
+    const { data, error } = await supabase
+      .from("swipe_file_offers")
+      .update({ status_updated: "in_progress", claimed_at: now })
+      .or("status_updated.is.null,status_updated.eq.pending")
+      .eq("id", offerId)
+      .select("id");
+    if (error) {
+      console.warn(`[${offerId}] claim error:`, error.message || error);
+      return false;
+    }
+    // if data is non-empty, update succeeded (we claimed)
+    return Array.isArray(data) && data.length > 0;
+  } catch (err) {
+    console.warn(`[${offerId}] exception during claim:`, err?.message || err);
+    return false;
+  }
+}
+
 (async () => {
-  console.log("🚀 Iniciando scraper (reinício mid-run ativado).");
-  console.log(`Config: PARALLEL=${PARALLEL}, WAIT_TIME=${WAIT_TIME}ms, RESTART_AT_PERCENT=${RESTART_AT_PERCENT}%, RESTART_ON_CONSEC_FAILS=${RESTART_ON_CONSEC_FAILS}, RESTART_BACKOFF_MS=${RESTART_BACKOFF_MS}ms, PROCESS_LIMIT=${PROCESS_LIMIT || "none"}`);
+  console.log("🚀 Scraper iniciado (sharding + claim + debug).");
+  console.log(`ENV: TOTAL_BATCHES=${TOTAL_BATCHES} BATCH_ID=${BATCH_ID} PROCESS_LIMIT=${PROCESS_LIMIT || "none"} PARALLEL=${PARALLEL}`);
 
-  // iniciar browser
-  let browser = await chromium.launch({ headless: true });
+  ensureDebugDir();
 
-  // fetch ofertas
-  const { data: offersRaw, error: offersError } = await supabase
-    .from("swipe_file_offers")
-    .select("*");
-
-  if (offersError) {
-    console.error("❌ Erro ao buscar ofertas:", offersError);
-    try { await browser.close(); } catch {}
-    process.exit(1);
-  }
-
-  if (!Array.isArray(offersRaw) || offersRaw.length === 0) {
-    console.log("ℹ️ Nenhuma oferta encontrada. Encerrando.");
-    try { await browser.close(); } catch {}
-    process.exit(0);
-  }
-
-  // shuffle + limit
-  const offersShuffled = fisherYatesShuffle(offersRaw);
-  const offers = PROCESS_LIMIT ? offersShuffled.slice(0, PROCESS_LIMIT) : offersShuffled;
-  const totalOffers = offers.length;
-  const restartThreshold = Math.ceil((RESTART_AT_PERCENT / 100) * totalOffers);
-
-  console.log(`📦 Total de ofertas a processar: ${totalOffers} (restartThreshold=${restartThreshold})`);
-
-  // counters
-  let processedCount = 0;
-  let consecutiveFails = 0;
-  let consecutiveSuccess = 0;
+  const browser = await chromium.launch({ headless: true });
 
   // graceful shutdown
   let shuttingDown = false;
-  async function safeCloseBrowser() {
-    if (!browser) return;
-    try { await browser.close(); } catch (e) { /* ignore */ }
-    browser = null;
-  }
-  async function handleShutdown() {
+  const safeClose = async () => {
     if (shuttingDown) return;
     shuttingDown = true;
-    console.log("🛑 Recebido sinal de encerramento. Fechando browser...");
-    await safeCloseBrowser();
+    console.log("🛑 Encerrando: fechando browser...");
+    try { await browser.close(); } catch (e) {}
+    process.exit(0);
+  };
+  process.on("SIGINT", safeClose);
+  process.on("SIGTERM", safeClose);
+
+  // fetch offers
+  const { data: offersRaw, error: offersError } = await supabase.from("swipe_file_offers").select("*");
+  if (offersError) {
+    console.error("❌ Erro ao buscar ofertas:", offersError);
+    await browser.close();
+    process.exit(1);
+  }
+  if (!Array.isArray(offersRaw) || offersRaw.length === 0) {
+    console.log("ℹ️ Nenhuma oferta encontrada. Encerrando.");
+    await browser.close();
     process.exit(0);
   }
-  process.on("SIGINT", handleShutdown);
-  process.on("SIGTERM", handleShutdown);
 
-  // main loop em blocos
-  for (let i = 0; i < offers.length; i += PARALLEL) {
+  // deterministic ordering then shuffle to spread batches
+  const offersSorted = offersRaw.slice().sort((a,b) => {
+    if (a.id == null) return 1;
+    if (b.id == null) return -1;
+    return String(a.id).localeCompare(String(b.id), undefined, { numeric: true });
+  });
+  const offersShuffled = fisherYatesShuffle(offersSorted);
+
+  // apply sharding
+  const offersSharded = offersShuffled.filter((_, idx) => (idx % TOTAL_BATCHES) === (BATCH_ID - 1));
+  const offersToProcess = PROCESS_LIMIT ? offersSharded.slice(0, PROCESS_LIMIT) : offersSharded;
+
+  console.log(`📦 Total ofertas originais: ${offersRaw.length}`);
+  console.log(`📂 Batch ${BATCH_ID}/${TOTAL_BATCHES}: ${offersToProcess.length} ofertas a processar`);
+
+  let processedCount = 0;
+  let successCount = 0;
+  let failCount = 0;
+
+  for (let i = 0; i < offersToProcess.length; i += PARALLEL) {
     if (shuttingDown) break;
-
-    const batch = offers.slice(i, i + PARALLEL);
+    const batch = offersToProcess.slice(i, i + PARALLEL);
     console.log(`\n🧩 Bloco ${Math.floor(i / PARALLEL) + 1}: ${batch.length} ofertas (PARALLEL=${PARALLEL})`);
 
-    // processar bloco em paralelo
     await Promise.all(batch.map(async (offer, idxInBatch) => {
-      if (!offer?.adLibraryUrl) {
-        console.warn(`⚠️ [${offer?.id}] Sem adLibraryUrl — pulando.`);
+      if (!offer?.id || !offer?.adLibraryUrl) {
+        console.warn(`⚠️ [${offer?.id}] oferta inválida, pulando.`);
+        return;
+      }
+
+      // attempt claim
+      const claimed = await tryClaimOffer(offer.id);
+      if (!claimed) {
+        console.log(`🔒 [${offer.id}] Não foi possível claim (outro worker pode ter claimado). Pulando.`);
         return;
       }
 
       const globalIndex = i + idxInBatch;
       const { device, ua } = pickDeviceAndUA(globalIndex);
 
-      // criar contexto com device + UA
       const contextOptions = { ...(device || {}) };
       if (ua) contextOptions.userAgent = ua;
 
-      let context;
-      let page;
+      let context, page;
       try {
         context = await browser.newContext(contextOptions);
         await context.route("**/*", (route) => {
@@ -165,22 +202,17 @@ function pickDeviceAndUA(index) {
         });
 
         page = await context.newPage();
-        console.log(`⌛ [${offer.id}] Acessando (device=${device?.name || "custom"}, ua=${ua.slice(0, 60)}...): ${offer.adLibraryUrl}`);
+        console.log(`⌛ [${offer.id}] Acessando (${device?.name || "custom"} / UA=${ua ? ua.slice(0,60) + "..." : "n/a"}): ${offer.adLibraryUrl}`);
 
-        // navegação e wait
         await page.goto(offer.adLibraryUrl, { waitUntil: "networkidle", timeout: NAV_TIMEOUT });
         await page.waitForTimeout(WAIT_TIME);
 
-        // tentar esperar por seletor que geralmente mostra resultados
         try {
           await page.waitForSelector('div:has-text("resultados"), div:has-text("results")', { timeout: 15000 });
-        } catch {
-          // fallback para leitura do conteúdo
-        }
+        } catch {}
 
         const html = await page.content();
         let match = html.match(/(\d+(?:[.,]\d+)?)\s*(?:resultados|results)/i);
-
         if (!match) {
           const bodyText = await page.textContent("body");
           match = bodyText && bodyText.match(/(\d+(?:[.,]\d+)?)\s*(?:resultados|results)/i);
@@ -190,95 +222,59 @@ function pickDeviceAndUA(index) {
 
         if (match) {
           const activeAds = parseInt(String(match[1]).replace(/\./g, "").replace(/,/g, ""), 10);
-          console.log(`✅ [${offer.id}] ${offer.offerName}: ${activeAds} anúncios`);
+          console.log(`✅ [${offer.id}] ${offer.offerName || "offer"}: ${activeAds} anúncios`);
 
           const { data, error } = await supabase
             .from("swipe_file_offers")
-            .update({ activeAds, updated_at, status_updated: "success" })
+            .update({ activeAds, updated_at, status_updated: "success", debug_html_path: null, debug_png_path: null })
             .eq("id", offer.id);
 
           if (error) {
-            console.warn(`⚠️ [${offer.id}] Erro ao atualizar Supabase: ${error.message || error}`);
+            console.warn(`⚠️ [${offer.id}] Erro ao atualizar DB: ${error?.message || error}`);
           }
 
-          consecutiveSuccess++;
-          consecutiveFails = 0;
+          successCount++;
         } else {
-          console.warn(`❌ [${offer.id}] contador não encontrado`);
+          console.warn(`❌ [${offer.id}] contador não encontrado — salvando debug`);
+          const dbg = await saveDebug(page, offer.id, "no-counter");
           const { error } = await supabase
             .from("swipe_file_offers")
-            .update({ activeAds: null, updated_at, status_updated: "no_counter" })
+            .update({ activeAds: null, updated_at, status_updated: "no_counter", debug_html_path: dbg.htmlPath || dbg.htmlPath, debug_png_path: dbg.pngPath || dbg.pngPath })
             .eq("id", offer.id);
-
-          if (error) {
-            console.warn(`⚠️ [${offer.id}] Erro ao atualizar Supabase (no_counter): ${error.message || error}`);
-          }
-
-          consecutiveFails++;
-          consecutiveSuccess = 0;
+          if (error) console.warn(`⚠️ [${offer.id}] Erro ao atualizar DB (no_counter): ${error?.message || error}`);
+          failCount++;
         }
       } catch (err) {
         console.error(`🚫 [${offer.id}] Erro ao processar: ${err?.message || err}`);
+        const dbg = page ? await saveDebug(page, offer.id, `exception-${err?.message || "err"}`) : {};
         try {
           await supabase
             .from("swipe_file_offers")
-            .update({ activeAds: null, updated_at: new Date().toISOString(), status_updated: "error" })
+            .update({ activeAds: null, updated_at: new Date().toISOString(), status_updated: "error", debug_html_path: dbg.htmlPath || dbg.htmlPath, debug_png_path: dbg.pngPath || dbg.pngPath })
             .eq("id", offer.id);
         } catch (e) {
-          console.warn(`⚠️ [${offer.id}] Falha ao atualizar Supabase após erro: ${e?.message || e}`);
+          console.warn(`⚠️ [${offer.id}] Falha ao atualizar DB após erro: ${e?.message || e}`);
         }
-        consecutiveFails++;
-        consecutiveSuccess = 0;
+        failCount++;
       } finally {
         try { if (page) await page.close(); } catch {}
         try { if (context) await context.close(); } catch {}
         processedCount++;
-        // small randomized delay to spread requests
-        await randomDelay(800, 1600);
+        // small randomized delay
+        await sleep(500 + jitter(800));
       }
-    })); // end Promise.all batch
+    })); // end Promise.all
 
-    // logs de progresso
-    console.log(`📊 Progresso: processed=${processedCount}/${totalOffers} | consecutiveFails=${consecutiveFails} | consecutiveSuccess=${consecutiveSuccess}`);
+    // small pause between batches
+    await sleep(500 + jitter(1000));
+  }
 
-    // gatilho 1: reiniciar quando processed >= restartThreshold (percentual do total)
-    if (processedCount >= restartThreshold) {
-      console.log(`♻️ Reiniciando browser: atingido ${RESTART_AT_PERCENT}% do total (processed=${processedCount})`);
-      try { await browser.close(); } catch (e) { console.warn("⚠️ Erro ao fechar browser:", e?.message || e); }
-      const backoff = RESTART_BACKOFF_MS + Math.floor(Math.random() * 3000);
-      console.log(`⏳ Pausa de ${Math.round(backoff)}ms antes de novo browser`);
-      await sleep(backoff);
-      browser = await chromium.launch({ headless: true });
-      consecutiveFails = 0;
-      consecutiveSuccess = 0;
-      // continue implicitamente para próximos blocos
-      continue;
-    }
-
-    // gatilho 2: reiniciar reativamente se muitas falhas consecutivas
-    if (consecutiveFails >= RESTART_ON_CONSEC_FAILS) {
-      console.log(`♻️ Reiniciando browser: ${consecutiveFails} falhas consecutivas (threshold=${RESTART_ON_CONSEC_FAILS})`);
-      try { await browser.close(); } catch (e) { console.warn("⚠️ Erro ao fechar browser:", e?.message || e); }
-      const backoff = RESTART_BACKOFF_MS + Math.floor(Math.random() * 5000);
-      console.log(`⏳ Pausa de ${Math.round(backoff)}ms antes de novo browser`);
-      await sleep(backoff);
-      browser = await chromium.launch({ headless: true });
-      consecutiveFails = 0;
-      consecutiveSuccess = 0;
-      continue;
-    }
-
-    // pausa ocasional para reduzir taxa (igual lógica original)
-    if ((i + PARALLEL) % 100 === 0) {
-      const pause = Math.floor(Math.random() * 15000) + 30000;
-      console.log(`⏸️ Pausa extra de ${(pause / 1000).toFixed(1)}s para reduzir risco de bloqueio`);
-      await sleep(pause);
-    }
-  } // end for batches
-
-  // final cleanup
   try { await browser.close(); } catch (e) {}
-  console.log("✅ Scraper finalizado.");
-  console.log(`📈 Totais: processed=${processedCount}/${totalOffers} | final consecutiveFails=${consecutiveFails}`);
+  console.log("✅ Execução finalizada.");
+  console.log(`📈 Processed: ${processedCount}`);
+  console.log(`✔️ Success: ${successCount}`);
+  console.log(`❌ Failures: ${failCount}`);
+  console.log(`🗂 Debug files (se houver): ${path.resolve(DEBUG_DIR)}`);
+
   process.exit(0);
 })();
