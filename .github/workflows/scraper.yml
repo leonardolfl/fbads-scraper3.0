@@ -47,4 +47,33 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          # adiciona aqui outras variáveis que você usa, ex: TOTAL_BATCHES, BATCH_ID
         run: node scraper.mjs
+
+      # --- passos adicionais para debugar e persistir arquivos debug ---
+      - name: Listar arquivos debug (imprime nomes/emails para logs)
+        if: always()
+        run: |
+          echo "Runner workspace: $RUNNER_WORKSPACE"
+          echo "Debug path (relativo): ./debug"
+          echo "Debug path (abs): $RUNNER_WORKSPACE/debug"
+          ls -la ./debug || echo "Pasta ./debug não encontrada"
+          # mostrar os primeiros 200 bytes dos .html para um diagnóstico rápido
+          for f in ./debug/*; do
+            if [ -f "$f" ]; then
+              echo "---- ARQUIVO: $f ----"
+              case "$f" in
+                *.html) echo "HTML (primeiras 200 linhas):"; sed -n '1,200p' "$f" || true ;;
+                *.png) echo "É imagem PNG: $f (não mostrado no log)"; ;;
+                *) echo "Conteúdo (primeiras 50 linhas):"; sed -n '1,50p' "$f" || true ;;
+              esac
+            fi
+          done
+
+      - name: Upload debug artifacts
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: debug-${{ github.run_id }}
+          path: debug
+          retention-days: 7
