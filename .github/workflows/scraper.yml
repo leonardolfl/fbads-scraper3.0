@@ -1,5 +1,9 @@
 name: FB Ads Scraper Diário
 
+# Permissões necessárias para que o job consiga push com GITHUB_TOKEN
+permissions:
+  contents: write
+
 on:
   schedule:
     # Rodar todo dia às 7h da manhã (UTC-3 → 10h UTC)
@@ -13,6 +17,8 @@ jobs:
     steps:
       - name: Checkout do repositório
         uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
 
       - name: Setup Node.js 20
         uses: actions/setup-node@v3
@@ -47,28 +53,35 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-          # adiciona aqui outras variáveis que você usa, ex: TOTAL_BATCHES, BATCH_ID
+          # Variáveis opcionais de sharding/cuidados:
+          # TOTAL_BATCHES, BATCH_ID, PROCESS_LIMIT, PARALLEL, etc.
         run: node scraper.mjs
 
       # --- passos adicionais para debugar e persistir arquivos debug ---
-      - name: Listar arquivos debug (imprime nomes/emails para logs)
+      - name: Listar arquivos debug (imprime nomes e primeiras linhas dos .html)
         if: always()
         run: |
           echo "Runner workspace: $RUNNER_WORKSPACE"
           echo "Debug path (relativo): ./debug"
           echo "Debug path (abs): $RUNNER_WORKSPACE/debug"
-          ls -la ./debug || echo "Pasta ./debug não encontrada"
-          # mostrar os primeiros 200 bytes dos .html para um diagnóstico rápido
-          for f in ./debug/*; do
-            if [ -f "$f" ]; then
-              echo "---- ARQUIVO: $f ----"
-              case "$f" in
-                *.html) echo "HTML (primeiras 200 linhas):"; sed -n '1,200p' "$f" || true ;;
-                *.png) echo "É imagem PNG: $f (não mostrado no log)"; ;;
-                *) echo "Conteúdo (primeiras 50 linhas):"; sed -n '1,50p' "$f" || true ;;
-              esac
-            fi
-          done
+          if [ -d "./debug" ]; then
+            echo "== Conteúdo da pasta ./debug =="
+            ls -la ./debug || true
+            echo "== Primeiras linhas dos HTMLs (até 200 linhas por arquivo) =="
+            for f in ./debug/*; do
+              if [ -f "$f" ]; then
+                echo "---- ARQUIVO: $f ----"
+                case "$f" in
+                  *.html) sed -n '1,200p' "$f" || true ;;
+                  *.png) echo "(imagem PNG) $f" ;;
+                  *) sed -n '1,100p' "$f" || true ;;
+                esac
+                echo ""
+              fi
+            done
+          else
+            echo "Pasta ./debug não encontrada"
+          fi
 
       - name: Upload debug artifacts
         if: always()
@@ -76,4 +89,60 @@ jobs:
         with:
           name: debug-${{ github.run_id }}
           path: debug
-          retention-days: 7
+          retention-days: 1
+
+      - name: Commit debug files to debug-artifacts branch
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # Se não houver debug, sair sem erro
+          if [ ! -d "./debug" ]; then
+            echo "Não há pasta ./debug para commitar. Nenhuma ação necessária."
+            exit 0
+          fi
+
+          # Copiar debug para um tmp para preservar antes de trocar branch
+          tmpdir=$(mktemp -d)
+          echo "Copiando ./debug para $tmpdir/debug"
+          cp -r ./debug "$tmpdir"/debug || true
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Buscar referência remota
+          git fetch origin
+
+          # Se branch existir, pegar ela; caso contrário criar um orphan branch
+          if git ls-remote --exit-code --heads origin debug-artifacts; then
+            echo "Branch debug-artifacts existe — checkout para atualização"
+            git checkout -B debug-artifacts origin/debug-artifacts
+            # remover arquivos atuais do branch (será substituído)
+            git rm -rf . || true
+          else
+            echo "Branch debug-artifacts não existe — criando branch orphan"
+            git checkout --orphan debug-artifacts
+            # remover arquivos do working tree
+            git rm -rf . || true
+          fi
+
+          # copiar os arquivos salvos no tmp para o repo
+          mkdir -p debug
+          # Se o tmp contém apenas uma pasta debug, movemos seu conteúdo
+          if [ -d "$tmpdir/debug" ]; then
+            cp -r "$tmpdir"/debug/* debug/ || true
+          fi
+
+          # Add e commit somente se houver mudanças
+          git add -A debug || true
+
+          if git diff --cached --quiet; then
+            echo "Sem mudanças a commitar no branch debug-artifacts"
+          else
+            git commit -m "chore(debug): upload debug artifacts for run $GITHUB_RUN_ID"
+            # Forçar push substituindo o estado do branch (sobrescreve o conteúdo)
+            git push --force "https://${GITHUB_ACTOR}:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git" HEAD:debug-artifacts
+            echo "Push para branch debug-artifacts concluído."
+          fi
