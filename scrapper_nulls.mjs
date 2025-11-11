@@ -3,11 +3,16 @@
 /**
  * scraper_nulls.mjs
  *
- * Processa apenas ofertas com activeAds IS NULL.
+ * Processa apenas ofertas com activeAds IS NULL e deleted_at IS NULL.
  * - Distribui trabalho entre TOTAL_WORKERS (default 4) via WORKER_INDEX.
  * - Cada worker processa blocos com PARALLEL (default 3).
  * - Tempos maiores para renderização (WAIT_TIME default 7000ms).
  * - RETRY_ATTEMPTS default 1.
+ *
+ * Soft-delete behavior:
+ * - Quando, após uma tentativa (retry) numa execução, a extração NÂO obtiver resultado,
+ *   incrementa attempts. Se attempts >= 3 -> marca deleted_at = now(), status_updated='soft_deleted'.
+ * - Mesmo comportamento aplicado quando confirmar bloqueio.
  *
  * Uso sugerido (GitHub Actions job para 4 workers):
  *   TOTAL_WORKERS=4 WORKER_INDEX=<0..3> PARALLEL=3 node scraper_nulls.mjs
@@ -242,15 +247,49 @@ async function processOffers(offersSlice) {
             }
 
             if (confirmedBlock) {
-              logInfo(`[${offer.id}] updating DB: blocked_ip + activeAds=null`);
-              try {
-                const { data, error } = await supabase
-                  .from("swipe_file_offers")
-                  .update({ activeAds: null, updated_at: nowIso(), status_updated: "blocked_ip", attempts: Number(offer.attempts ?? 0) + 1 })
-                  .eq("id", offer.id);
-                if (error) logWarn(`[${offer.id}] DB update blocked_ip failed: ${error.message || JSON.stringify(error)}`);
-                else logInfo(`[${offer.id}] DB updated blocked_ip (rows=${(data||[]).length})`);
-              } catch (e) { logWarn(`[${offer.id}] DB exception on blocked_ip update: ${e && e.message}`); }
+              // Soft-delete decision if attempts threshold reached
+              const currentAttempts = Number(offer.attempts ?? 0);
+              const newAttempts = currentAttempts + 1;
+              if (newAttempts >= 3) {
+                logInfo(`[${offer.id}] confirmed block & attempts=${newAttempts} >=3 -> soft-deleting`);
+                try {
+                  const { data, error } = await supabase
+                    .from("swipe_file_offers")
+                    .update({ activeAds: null, updated_at: nowIso(), status_updated: "soft_deleted", attempts: newAttempts, deleted_at: nowIso() })
+                    .eq("id", offer.id);
+                  if (error) {
+                    logWarn(`[${offer.id}] DB soft-delete failed for blocked: ${error.message || JSON.stringify(error)} - falling back to update attempts/status`);
+                    // fallback: try update without deleted_at if permission restricted
+                    try {
+                      const { data: f, error: fe } = await supabase
+                        .from("swipe_file_offers")
+                        .update({ activeAds: null, updated_at: nowIso(), status_updated: "blocked_ip", attempts: newAttempts })
+                        .eq("id", offer.id);
+                      if (fe) logWarn(`[${offer.id}] fallback update also failed: ${fe.message || JSON.stringify(fe)}`);
+                      else logInfo(`[${offer.id}] fallback update succeeded (blocked_ip)`);
+                    } catch (e) {
+                      logWarn(`[${offer.id}] fallback exception: ${String(e?.message || e)}`);
+                    }
+                  } else {
+                    logInfo(`[${offer.id}] soft-deleted (blocked) - rows=${(data||[]).length}`);
+                  }
+                } catch (e) {
+                  logWarn(`[${offer.id}] exception during soft-delete (blocked): ${String(e?.message || e)}`);
+                }
+              } else {
+                // mark blocked_ip and increment attempts
+                try {
+                  const { data, error } = await supabase
+                    .from("swipe_file_offers")
+                    .update({ activeAds: null, updated_at: nowIso(), status_updated: "blocked_ip", attempts: newAttempts })
+                    .eq("id", offer.id);
+                  if (error) logWarn(`[${offer.id}] DB update blocked_ip failed: ${error.message || JSON.stringify(error)}`);
+                  else logInfo(`[${offer.id}] marked blocked_ip (attempts=${newAttempts})`);
+                } catch (e) {
+                  logWarn(`[${offer.id}] exception updating blocked_ip: ${String(e?.message || e)}`);
+                }
+              }
+              try { if (!page.isClosed()) await page.close(); } catch (e) {}
               return;
             }
           } // end block confirm
@@ -284,17 +323,47 @@ async function processOffers(offersSlice) {
               logWarn(`[${offer.id}] DB exception on success update: ${e && e.message}`);
             }
           } else {
-            // Not found after retries => set activeAds = null (explicit) and mark erro
-            logWarn(`[${offer.id}] not found after retries -> setting activeAds=null`);
-            try {
-              const { data, error } = await supabase
-                .from("swipe_file_offers")
-                .update({ activeAds: null, updated_at: ts, status_updated: "erro", attempts: Number(offer.attempts ?? 0) + 1 })
-                .eq("id", offer.id);
-              if (error) logWarn(`[${offer.id}] DB update final erro failed: ${error.message || JSON.stringify(error)}`);
-              else logInfo(`[${offer.id}] DB updated erro & activeAds=null (rows=${(data||[]).length})`);
-            } catch (e) {
-              logWarn(`[${offer.id}] DB exception on final erro update: ${e && e.message}`);
+            // Not found after retries => soft-delete if attempts threshold reached, else mark erro and increment attempts
+            const currentAttempts = Number(offer.attempts ?? 0);
+            const newAttempts = currentAttempts + 1;
+            if (newAttempts >= 3) {
+              logWarn(`[${offer.id}] not found after retries & attempts=${newAttempts} >=3 -> soft-deleting`);
+              try {
+                const { data, error } = await supabase
+                  .from("swipe_file_offers")
+                  .update({ activeAds: null, updated_at: ts, status_updated: "soft_deleted", attempts: newAttempts, deleted_at: ts })
+                  .eq("id", offer.id);
+                if (error) {
+                  logWarn(`[${offer.id}] DB soft-delete failed: ${error.message || JSON.stringify(error)} - falling back to update attempts/status`);
+                  try {
+                    const { data: f, error: fe } = await supabase
+                      .from("swipe_file_offers")
+                      .update({ activeAds: null, updated_at: ts, status_updated: "erro", attempts: newAttempts })
+                      .eq("id", offer.id);
+                    if (fe) logWarn(`[${offer.id}] fallback update also failed: ${fe.message || JSON.stringify(fe)}`);
+                    else logInfo(`[${offer.id}] fallback update succeeded (erro)`);
+                  } catch (e) {
+                    logWarn(`[${offer.id}] fallback exception: ${String(e?.message || e)}`);
+                  }
+                } else {
+                  logInfo(`[${offer.id}] soft-deleted (erro) - rows=${(data||[]).length}`);
+                }
+              } catch (e) {
+                logWarn(`[${offer.id}] exception during soft-delete: ${String(e?.message || e)}`);
+              }
+            } else {
+              // regular update: mark erro and increment attempts
+              logWarn(`[${offer.id}] not found after retries -> setting activeAds=null, attempts=${newAttempts}`);
+              try {
+                const { data, error } = await supabase
+                  .from("swipe_file_offers")
+                  .update({ activeAds: null, updated_at: ts, status_updated: "erro", attempts: newAttempts })
+                  .eq("id", offer.id);
+                if (error) logWarn(`[${offer.id}] DB update final erro failed: ${error.message || JSON.stringify(error)}`);
+                else logInfo(`[${offer.id}] DB updated erro & activeAds=null (rows=${(data||[]).length})`);
+              } catch (e) {
+                logWarn(`[${offer.id}] DB exception on final erro update: ${e && e.message}`);
+              }
             }
 
             if (DEBUG) {
@@ -349,11 +418,12 @@ async function processOffers(offersSlice) {
   logInfo(`scraper_nulls starting worker ${WORKER_INDEX}/${TOTAL_WORKERS} - ${WORKER_ID}`);
   if (DEBUG) ensureDebugDir();
 
-  // fetch only NULL activeAds
+  // fetch only NULL activeAds and not soft-deleted
   const { data: offersAll, error } = await supabase
     .from("swipe_file_offers")
     .select("*")
     .is("activeAds", null)
+    .is("deleted_at", null)
     .order("id", { ascending: true });
   if (error) {
     logError("Error fetching NULL offers:", error);
