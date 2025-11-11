@@ -1,5 +1,8 @@
-name: FB Ads Scraper Diário
-
+# GitHub Actions workflow: FB Ads Scraper Diário
+# Executa:
+# 1) 50 workers (scraper.mjs)
+# 2) 4 workers para reprocessar apenas NULLs (scraper_nulls.mjs)
+# 3) gerador do eagle_offers_data.json (update-eagle-json.mjs)
 on:
   schedule:
     # Executa todo dia às 7h da manhã (10h UTC)
@@ -8,7 +11,7 @@ on:
 
 jobs:
   # -------------------------------
-  # 1. SCRAPER WORKERS
+  # 1. SCRAPER WORKERS (50 instâncias)
   # -------------------------------
   scraper-workers:
     runs-on: ubuntu-latest
@@ -38,20 +41,61 @@ jobs:
         with:
           node-version: 20
       - run: npm ci --prefer-offline
-      - run: node scraper.mjs
+      - name: Run main scraper worker
+        run: node scraper.mjs
 
   # -------------------------------
-  # 2. UPDATE EAGLE JSON
+  # 2. SCRAPER NULLS (4 instâncias)
+  # Reprocessa apenas linhas com activeAds IS NULL
+  # -------------------------------
+  scraper-nulls:
+    name: Reprocessar NULLs (4 workers)
+    runs-on: ubuntu-latest
+    needs: scraper-workers
+    container:
+      image: mcr.microsoft.com/playwright:v1.56.1-jammy
+      options: --shm-size=1g
+
+    strategy:
+      matrix:
+        worker_index: [0,1,2,3]
+      fail-fast: false
+
+    env:
+      TOTAL_WORKERS: 4
+      WORKER_INDEX: ${{ matrix.worker_index }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+      LOG_LEVEL: info
+      PARALLEL: 3
+      WAIT_TIME: 7000
+      NAV_TIMEOUT: 90000
+      SELECTOR_TIMEOUT: 15000
+      RETRY_ATTEMPTS: 1
+      DEBUG: false
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm ci --prefer-offline
+      - name: Run NULLs scraper
+        run: node scraper_nulls.mjs
+
+  # -------------------------------
+  # 3. UPDATE EAGLE JSON (após todos os scrapers)
   # -------------------------------
   update-eagle-json:
     name: Atualizar eagle_offers_data.json
     runs-on: ubuntu-latest
-    needs: scraper-workers   # só roda depois que todos os workers terminarem
+    needs: scraper-nulls   # roda depois dos 50 workers e dos 4 null-workers
 
     env:
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
       EAGLE_UPDATE_URL: ${{ secrets.EAGLE_UPDATE_URL }}
+      LOG_LEVEL: info
 
     steps:
       - uses: actions/checkout@v4
