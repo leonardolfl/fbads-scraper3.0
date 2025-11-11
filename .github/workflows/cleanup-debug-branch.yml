@@ -1,0 +1,55 @@
+name: Cleanup debug-artifacts Branch (Diário)
+
+# Permissão para sobrescrever branch usando GITHUB_TOKEN
+permissions:
+  contents: write
+
+on:
+  schedule:
+    # Executa 1 vez por dia (UTC) — ajusta se quiser outro horário
+    - cron: '0 2 * * *' # 02:00 UTC (ajuste conforme necessário)
+  workflow_dispatch: {}
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository (full)
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Clean debug-artifacts branch (remove debug files)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git fetch origin
+
+          if git ls-remote --exit-code --heads origin debug-artifacts; then
+            echo "Checkout branch debug-artifacts"
+            git checkout -B debug-artifacts origin/debug-artifacts
+          else
+            echo "Branch debug-artifacts não existe — nada a limpar"
+            exit 0
+          fi
+
+          # Remove a pasta debug e cria um placeholder (para manter o branch com um commit)
+          rm -rf debug || true
+          mkdir -p debug
+          echo "Limpeza executada em $(date -u)" > debug/README.txt
+
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Nenhuma mudança detectada — nada a commitar"
+          else
+            git commit -m "chore(debug): daily cleanup $(date -u)"
+            git push --force "https://${GITHUB_ACTOR}:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git" HEAD:debug-artifacts
+            echo "Branch debug-artifacts limpa e atualizada."
+          fi
