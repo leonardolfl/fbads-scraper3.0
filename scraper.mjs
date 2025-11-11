@@ -17,20 +17,11 @@
  * - Se extração falhar após retry: marca status_updated = "erro" (X vermelho na UI) e incrementa attempts
  * - DEBUG mode salva HTML apenas quando DEBUG=true (sem screenshots)
  *
- * ENV:
- * WORKER_INDEX, TOTAL_WORKERS, PROCESS_LIMIT
- * PARALLEL default 5
- * CONTEXT_POOL_SIZE default PARALLEL
- * PROCESS_PER_CONTEXT default 20
- * NEW_CONTEXT_PROB default 0.05
- * WAIT_TIME default 4000 (ms)
- * NAV_TIMEOUT default 60000 (ms)
- * SELECTOR_TIMEOUT default 10000 (ms)
- * RETRY_ATTEMPTS default 1
- * MAX_FAILS default 3
- * DEBUG default false
- * LOG_LEVEL default "info" (info|warn|error|silent)
- * DEBUG_DIR default ./debug
+ * USO SUGERIDO PARA DEBUG:
+ * WORKER_INDEX=0 TOTAL_WORKERS=1 PARALLEL=1 PROCESS_LIMIT=5 DEBUG=true node scraper.mjs
+ *
+ * Nota: Esta versão garante que, após esgotados os retries desta execução,
+ * o campo activeAds é definido como null (ou seja, imediatamente quando a extração falha).
  */
 
 import fs from "fs";
@@ -397,12 +388,14 @@ async function processOffers(offersSlice) {
                 blockedCount = 0;
               }
               try {
-                const { error } = await supabase
+                // Note: we keep marking blocked_ip; we DO NOT change this behavior unless requested.
+                logInfo(`[${offer.id}] marcando status_updated=blocked_ip (bloqueio confirmado)`);
+                const { data: blockData, error: blockErr } = await supabase
                   .from("swipe_file_offers")
                   .update({ updated_at: nowIso(), status_updated: "blocked_ip" })
                   .eq("id", offer.id);
-                if (error) logWarn(`[${offer.id}] Erro ao marcar blocked_ip no DB: ${error.message || error}`);
-                else logInfo(`[${offer.id}] marcado blocked_ip`);
+                if (blockErr) logWarn(`[${offer.id}] Erro ao marcar blocked_ip no DB: ${blockErr.message || JSON.stringify(blockErr)}`);
+                else logInfo(`[${offer.id}] marcado blocked_ip (db response rows=${(blockData||[]).length})`);
               } catch (e) {
                 logWarn(`[${offer.id}] Erro DB ao marcar blocked_ip: ${String(e?.message || e)}`);
               }
@@ -435,14 +428,17 @@ async function processOffers(offersSlice) {
           if (result.found) {
             const activeAds = result.count;
             try {
-              const { error } = await supabase
+              const { data: updData, error } = await supabase
               .from("swipe_file_offers")
               .update({ activeAds, updated_at, status_updated: "success", attempts: 0 })
               .eq("id", offer.id);
-              if (error) logWarn(`[${offer.id}] Erro ao atualizar DB: ${error.message || error}`);
-              else logInfo(`✅ [${offer.id}] atualizado activeAds=${activeAds}`);
+              if (error) {
+                logWarn(`[${offer.id}] Erro ao atualizar DB (success update): ${error.message || JSON.stringify(error)}`);
+              } else {
+                logInfo(`✅ [${offer.id}] atualizado activeAds=${activeAds} (db rows=${(updData||[]).length})`);
+              }
             } catch (e) {
-              logWarn(`[${offer.id}] Supabase update error: ${String(e?.message || e)}`);
+              logWarn(`[${offer.id}] Supabase update error (success): ${String(e?.message || e)}`);
             }
             consecutiveSuccess++;
             consecutiveFails = 0;
@@ -463,13 +459,17 @@ async function processOffers(offersSlice) {
             const currentAttempts = Number(offer.attempts ?? 0);
             const newAttempts = currentAttempts + 1;
             try {
-              // ALTERAÇÃO CIRÚRGICA: sempre setar activeAds = null após os retries desta execução
-              const { error } = await supabase
+              // CIRÚRGICO: sempre setar activeAds = null após os retries desta execução
+              logInfo(`[${offer.id}] Atualizando DB: setting activeAds=null, status_updated="erro", attempts=${newAttempts}`);
+              const { data: finalData, error: finalErr } = await supabase
                 .from("swipe_file_offers")
                 .update({ activeAds: null, updated_at, status_updated: "erro", attempts: newAttempts })
                 .eq("id", offer.id);
-              if (error) logWarn(`[${offer.id}] DB update (final erro) error: ${error.message || error}`);
-              else logInfo(`[${offer.id}] marcado erro e activeAds=null após ${newAttempts} tentativas`);
+              if (finalErr) {
+                logWarn(`[${offer.id}] DB update (final erro) falhou: ${finalErr.message || JSON.stringify(finalErr)}`);
+              } else {
+                logInfo(`[${offer.id}] marcado erro e activeAds=null após ${newAttempts} tentativas (db rows=${(finalData||[]).length})`);
+              }
             } catch (e) {
               logWarn(`[${offer.id}] Erro ao atualizar attempts/status: ${String(e?.message || e)}`);
             }
@@ -481,9 +481,13 @@ async function processOffers(offersSlice) {
             const currentAttempts = Number(offer.attempts ?? 0);
             const newAttempts = currentAttempts + 1;
             if (newAttempts >= MAX_FAILS) {
-              await supabase.from("swipe_file_offers").update({ activeAds: null, updated_at: nowIso(), status_updated: "error", attempts: newAttempts }).eq("id", offer.id);
+              const { data: errData, error: errUpdate } = await supabase.from("swipe_file_offers").update({ activeAds: null, updated_at: nowIso(), status_updated: "error", attempts: newAttempts }).eq("id", offer.id);
+              if (errUpdate) logWarn(`[${offer.id}] Erro ao gravar estado de exceção (final): ${errUpdate.message || JSON.stringify(errUpdate)}`);
+              else logInfo(`[${offer.id}] gravou estado de exceção e activeAds=null (db rows=${(errData||[]).length})`);
             } else {
-              await supabase.from("swipe_file_offers").update({ updated_at: nowIso(), status_updated: `error_attempt_${newAttempts}`, attempts: newAttempts }).eq("id", offer.id);
+              const { data: errData2, error: errUpdate2 } = await supabase.from("swipe_file_offers").update({ updated_at: nowIso(), status_updated: `error_attempt_${newAttempts}`, attempts: newAttempts }).eq("id", offer.id);
+              if (errUpdate2) logWarn(`[${offer.id}] Erro ao gravar estado de exceção (attempt increment): ${errUpdate2.message || JSON.stringify(errUpdate2)}`);
+              else logInfo(`[${offer.id}] gravou estado de exceção (attempt increment=${newAttempts}) (db rows=${(errData2||[]).length})`);
             }
           } catch (e) {
             logWarn(`[${offer.id}] DB update (exception) failed: ${String(e?.message || e)}`);
