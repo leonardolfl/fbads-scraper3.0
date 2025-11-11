@@ -22,22 +22,31 @@ async function main() {
     process.exit(0);
   }
 
-  // Mantém null literal (não string)
+  // Função para converter strings "null", "", undefined em null literal
+  const fix = (v) =>
+    v === null || v === undefined || v === "" || v === "null" || v === "NULL"
+      ? null
+      : v;
+
+  // Gera estrutura formatada corretamente
   const formatted = {
     version: new Date().toISOString().slice(0, 10),
     offers: offers.map((o) => ({
-      id: o.id ?? null,
-      offerName: o.offerName ?? null,
-      niche: o.niche ?? null,
-      activeAds: typeof o.activeAds === "number" ? o.activeAds : null,
-      location: o.location ?? null,
-      funnel: o.funnel ?? null,
-      deliverable: o.deliverable ?? null,
-      ticket: o.ticket ?? null,
-      dateAdded: o.dateAdded ?? o.created_at ?? null,
-      adLibraryUrl: o.adLibraryUrl ?? null,
-      pageUrl: o.pageUrl ?? null,
-      checkoutUrl: o.checkoutUrl ?? null,
+      id: fix(o.id),
+      offerName: fix(o.offerName),
+      niche: fix(o.niche),
+      activeAds:
+        typeof o.activeAds === "number"
+          ? o.activeAds
+          : Number(o.activeAds) || null,
+      location: fix(o.location),
+      funnel: fix(o.funnel),
+      deliverable: fix(o.deliverable),
+      ticket: fix(o.ticket),
+      dateAdded: fix(o.dateAdded ?? o.created_at),
+      adLibraryUrl: fix(o.adLibraryUrl),
+      pageUrl: fix(o.pageUrl),
+      checkoutUrl: fix(o.checkoutUrl),
     })),
   };
 
