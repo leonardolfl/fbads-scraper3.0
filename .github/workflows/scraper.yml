@@ -61,6 +61,7 @@ jobs:
           BATCH_ID: ${{ matrix.batch_id }}
           PROCESS_LIMIT: 150
           PARALLEL: 5
+          WORKER_ID: runner-${{ runner.name }}-batch-${{ matrix.batch_id }}-run-${{ github.run_id }}
         run: node scraper.mjs
 
       - name: Listar arquivos debug (imprime nomes e primeiras linhas dos .html)
