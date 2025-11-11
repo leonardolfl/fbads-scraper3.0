@@ -1,7 +1,8 @@
 // update-eagle-json.mjs
 import fs from "fs";
-import fetch from "node-fetch";
 import { supabase } from "./supabase.js";
+
+const fetchFn = globalThis.fetch || (await import("node-fetch")).default;
 
 async function main() {
   console.log("🦅 Iniciando atualização do eagle_offers_data.json...");
@@ -43,7 +44,6 @@ async function main() {
   fs.writeFileSync("eagle_offers_data.json", json);
   console.log(`✅ Gerado arquivo local com ${offers.length} ofertas.`);
 
-  // Upload via PHP remoto
   const uploadUrl = process.env.EAGLE_UPDATE_URL;
   if (!uploadUrl) {
     console.error("❌ Variável EAGLE_UPDATE_URL não definida nos secrets.");
@@ -53,7 +53,7 @@ async function main() {
   console.log(`🌐 Enviando JSON atualizado para ${uploadUrl} ...`);
 
   try {
-    const res = await fetch(uploadUrl, {
+    const res = await fetchFn(uploadUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: json,
