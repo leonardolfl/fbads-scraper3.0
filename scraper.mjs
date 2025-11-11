@@ -5,24 +5,24 @@ import { chromium, devices } from "playwright";
 import { supabase } from "./supabase.js";
 
 /**
- * scraper.mjs (completo)
- * - Sharding via TOTAL_BATCHES / BATCH_ID
- * - Claim atômico (claimed_at, claimed_by, claim_expires)
- * - Debug saving (HTML + PNG) em caso de falha
- * - Rotação de devices + user-agents por contexto
- *
- * ENV suportadas:
- *  - TOTAL_BATCHES (default 1)
- *  - BATCH_ID (1..TOTAL_BATCHES, default 1)
- *  - PROCESS_LIMIT (opcional)
- *  - PARALLEL (default 5)
- *  - WAIT_TIME (ms) default 7000
- *  - NAV_TIMEOUT (ms) default 60000
- *  - WORKER_ID (opcional) identificador do worker
+ * scraper.mjs (atualizado)
+ * - Sharding: TOTAL_BATCHES / BATCH_ID
+ * - Claim atômico em scrape_status (in_progress)
+ * - Campos DB usados: scrape_status, scrape_debug (jsonb), last_scraped_at, claimed_at, claimed_by, claim_expires
+ * - Debug: salva HTML + PNG em ./debug e grava paths em scrape_debug
+ * - Env:
+ *    SUPABASE_URL, SUPABASE_KEY (secrets)
+ *    TOTAL_BATCHES (default 1)
+ *    BATCH_ID (1..TOTAL_BATCHES, default 1)
+ *    PROCESS_LIMIT (opcional)
+ *    PARALLEL (default 5)
+ *    WAIT_TIME (ms) default 7000
+ *    NAV_TIMEOUT (ms) default 60000
+ *    WORKER_ID (opcional) identificador do worker (injetado pelo workflow)
  */
 
 const TOTAL_BATCHES = Math.max(1, parseInt(process.env.TOTAL_BATCHES || "1", 10));
-const BATCH_ID = Math.max(1, parseInt(process.env.BATCH_ID || "1", 10)); // 1-based
+const BATCH_ID = Math.max(1, parseInt(process.env.BATCH_ID || "1", 10));
 const PROCESS_LIMIT = process.env.PROCESS_LIMIT ? parseInt(process.env.PROCESS_LIMIT, 10) : null;
 let PARALLEL = Math.max(1, parseInt(process.env.PARALLEL || "5", 10));
 const WAIT_TIME = parseInt(process.env.WAIT_TIME || "7000", 10);
@@ -97,7 +97,7 @@ async function saveDebug(page, offerId, note) {
   }
 }
 
-// Claim helper: attempt atomic claim (status_updated IS NULL OR 'pending')
+// Claim helper: attempt atomic claim (scrape_status IS NULL OR 'pending')
 // Requires claimed_at/claimed_by/claim_expires columns present in DB
 async function tryClaimOffer(offerId) {
   try {
@@ -106,12 +106,12 @@ async function tryClaimOffer(offerId) {
     const { data, error } = await supabase
       .from("swipe_file_offers")
       .update({
-        status_updated: "in_progress",
+        scrape_status: "in_progress",
         claimed_at: now,
         claimed_by: WORKER_ID,
         claim_expires: expires,
       })
-      .or("status_updated.is.null,status_updated.eq.pending")
+      .or("scrape_status.is.null,scrape_status.eq.pending")
       .eq("id", offerId)
       .select("id");
     if (error) {
@@ -125,7 +125,7 @@ async function tryClaimOffer(offerId) {
   }
 }
 
-// Clear claim fields (keeps claimed_at as history, clears claimed_by and claim_expires)
+// Clear claim metadata (keep claimed_at as history)
 async function clearClaim(offerId) {
   try {
     const { error } = await supabase
@@ -188,6 +188,8 @@ async function clearClaim(offerId) {
   let processedCount = 0;
   let successCount = 0;
   let failCount = 0;
+  let consecutiveFails = 0;
+  let consecutiveSuccess = 0;
 
   for (let i = 0; i < offersToProcess.length; i += PARALLEL) {
     if (shuttingDown) break;
@@ -247,50 +249,69 @@ async function clearClaim(offerId) {
 
           const { error } = await supabase
             .from("swipe_file_offers")
-            .update({ activeAds, updated_at, status_updated: "success", debug_html_path: null, debug_png_path: null })
+            .update({
+              activeAds,
+              last_scraped_at: updated_at,
+              scrape_status: "success",
+              scrape_debug: null
+            })
             .eq("id", offer.id);
 
-          if (error) console.warn(`⚠️ [${offer.id}] Erro ao atualizar DB: ${error.message || error}`);
-          // clear claim metadata but keep claimed_at as history
+          if (error) {
+            console.warn(`⚠️ [${offer.id}] Erro ao atualizar DB: ${error.message || error}`);
+          }
+
+          // clear claim metadata (keep claimed_at as history)
           await clearClaim(offer.id);
 
+          consecutiveSuccess++;
+          consecutiveFails = 0;
           successCount++;
         } else {
           console.warn(`❌ [${offer.id}] contador não encontrado — salvando debug`);
           const dbg = await saveDebug(page, offer.id, "no-counter");
+          const debugObj = {
+            html_path: dbg.htmlPath || null,
+            png_path: dbg.pngPath || null,
+            note: "no_counter"
+          };
           const { error } = await supabase
             .from("swipe_file_offers")
             .update({
               activeAds: null,
-              updated_at,
-              status_updated: "no_counter",
-              debug_html_path: dbg.htmlPath || dbg.htmlPath,
-              debug_png_path: dbg.pngPath || dbg.pngPath,
+              last_scraped_at: updated_at,
+              scrape_status: "no_counter",
+              scrape_debug: debugObj
             })
             .eq("id", offer.id);
           if (error) console.warn(`⚠️ [${offer.id}] Erro ao atualizar DB (no_counter): ${error.message || error}`);
-          // clear claim metadata to allow re-processing later (keep claimed_at for history)
           await clearClaim(offer.id);
+          consecutiveFails++;
           failCount++;
         }
       } catch (err) {
         console.error(`🚫 [${offer.id}] Erro ao processar: ${err?.message || err}`);
         const dbg = page ? await saveDebug(page, offer.id, `exception-${String(err?.message || err)}`) : {};
+        const debugObj = {
+          html_path: dbg.htmlPath || null,
+          png_path: dbg.pngPath || null,
+          note: `exception: ${String(err?.message || err)}`
+        };
         try {
           await supabase
             .from("swipe_file_offers")
             .update({
               activeAds: null,
-              updated_at: new Date().toISOString(),
-              status_updated: "error",
-              debug_html_path: dbg.htmlPath || dbg.htmlPath,
-              debug_png_path: dbg.pngPath || dbg.pngPath,
+              last_scraped_at: new Date().toISOString(),
+              scrape_status: "error",
+              scrape_debug: debugObj
             })
             .eq("id", offer.id);
         } catch (e) {
           console.warn(`⚠️ [${offer.id}] Falha ao atualizar DB após erro: ${e?.message || e}`);
         }
         await clearClaim(offer.id);
+        consecutiveFails++;
         failCount++;
       } finally {
         try { if (page) await page.close(); } catch {}
@@ -301,15 +322,27 @@ async function clearClaim(offerId) {
       }
     })); // end Promise.all
 
-    // small pause between batches
-    await sleep(500 + jitter(1000));
+    // adaptive throttling
+    if (consecutiveFails >= 5 && PARALLEL > 3) {
+      PARALLEL = Math.max(3, Math.floor(PARALLEL / 2));
+      console.log(`⚠️ Reduzindo paralelismo para ${PARALLEL} (muitas falhas).`);
+    } else if (consecutiveSuccess >= 20 && PARALLEL < 8) {
+      PARALLEL = Math.min(8, PARALLEL + 2);
+      console.log(`✅ Aumentando paralelismo para ${PARALLEL} (estável).`);
+      consecutiveSuccess = 0;
+    }
+
+    // occasional longer pause
+    if ((i + PARALLEL) % 100 === 0) {
+      const pause = Math.floor(Math.random() * 15000) + 30000;
+      console.log(`⏸️ Pausa extra de ${(pause / 1000).toFixed(1)}s para reduzir risco de bloqueio`);
+      await sleep(pause);
+    }
   }
 
   try { await browser.close(); } catch (e) {}
-  console.log("✅ Execução finalizada.");
-  console.log(`📈 Processed: ${processedCount}`);
-  console.log(`✔️ Success: ${successCount}`);
-  console.log(`❌ Failures: ${failCount}`);
+  console.log("✅ Scraper finalizado.");
+  console.log(`📈 Totais: processed=${processedCount} | success=${successCount} | fail=${failCount}`);
   console.log(`🗂 Debug files (se houver): ${path.resolve(DEBUG_DIR)}`);
 
   process.exit(0);
