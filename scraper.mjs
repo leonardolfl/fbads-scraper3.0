@@ -5,20 +5,24 @@ import { chromium, devices } from "playwright";
 import { supabase } from "./supabase.js";
 
 /**
- * scraper.mjs - otimizado com fast-fetch + fallback Playwright
- * - Fast-path: fetch HTTP com timeout para extrair contador do HTML bruto.
- * - Fallback: Playwright com device pool + UA rotation, abort de recursos, retries.
- * - Mantém DB updates usando status_updated (sem alteração de schema).
- * - ENV:
- *   WORKER_INDEX, TOTAL_WORKERS
- *   PROCESS_LIMIT (opcional)
- *   PARALLEL (default 3)
- *   WAIT_TIME (ms) default 7000
- *   NAV_TIMEOUT (ms) default 60000
- *   FETCH_TIMEOUT_MS (ms) default 6000
- *   MAX_RETRIES (fallback attempts) default 3
- *   DEBUG_DIR default ./debug
- *   WORKER_ID optional
+ * scraper.mjs (selector-first, resource-blocking, 1 retry)
+ * - Mantém chunking por WORKER_INDEX e atualizações status_updated
+ * - Device pool + UA rotation
+ * - Abort imagens, stylesheets, fonts e media para reduzir HTML carregado
+ * - Usa selector/text regex para extrair contador (resultados|results)
+ * - Se não encontrar, faz 1 retry antes de marcar no_counter
+ *
+ * ENV:
+ * - WORKER_INDEX (injetado pelo workflow)
+ * - TOTAL_WORKERS (default 4)
+ * - PROCESS_LIMIT (opcional)
+ * - PARALLEL (default 3)
+ * - WAIT_TIME (ms) default 7000   -> tempo adicional após goto (ainda usado)
+ * - NAV_TIMEOUT (ms) default 60000
+ * - SELECTOR_TIMEOUT (ms) default 15000  -> tempo para waitForSelector
+ * - RETRY_ATTEMPTS (number of extra retries when selector not found) default 1
+ * - DEBUG_DIR default ./debug
+ * - WORKER_ID optional
  */
 
 const TOTAL_WORKERS = parseInt(process.env.TOTAL_WORKERS || "4", 10);
@@ -27,12 +31,11 @@ const PROCESS_LIMIT = process.env.PROCESS_LIMIT ? parseInt(process.env.PROCESS_L
 let PARALLEL = Math.max(1, parseInt(process.env.PARALLEL || "3", 10));
 const WAIT_TIME = parseInt(process.env.WAIT_TIME || "7000", 10);
 const NAV_TIMEOUT = parseInt(process.env.NAV_TIMEOUT || "60000", 10);
-const FETCH_TIMEOUT_MS = parseInt(process.env.FETCH_TIMEOUT_MS || "6000", 10);
-const MAX_RETRIES = Math.max(1, parseInt(process.env.MAX_RETRIES || "3", 10));
+const SELECTOR_TIMEOUT = parseInt(process.env.SELECTOR_TIMEOUT || "15000", 10);
+const RETRY_ATTEMPTS = Math.max(0, parseInt(process.env.RETRY_ATTEMPTS || "1", 10)); // number of retries when selector not found
 const DEBUG_DIR = process.env.DEBUG_DIR || "./debug";
 const WORKER_ID = process.env.WORKER_ID || `${os.hostname()}-${process.pid}-${Date.now()}`;
 
-// Device pool and UA pool
 const DEVICE_NAMES = [
   "iPhone 13 Pro Max",
   "iPhone 12",
@@ -51,12 +54,8 @@ const USER_AGENTS = [
   "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
   "Mozilla/5.0 (Windows NT 10.0; rv:122.0) Gecko/20100101 Firefox/122.0",
   "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
-  "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
-  "Mozilla/5.0 (Linux; Android 12; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Mobile Safari/537.36",
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
 ];
 
-// Helpers
 function ensureDebugDir() {
   if (!fs.existsSync(DEBUG_DIR)) fs.mkdirSync(DEBUG_DIR, { recursive: true });
 }
@@ -86,71 +85,6 @@ function pickDeviceAndUA(index) {
   return { device, ua };
 }
 
-// Robust extraction: tries regex with multiple keywords and a fallback neighbor-scan
-function extractCountFromText(text) {
-  if (!text || typeof text !== "string") return null;
-  const keywords = ["resultados", "results", "anúncios", "anuncios", "ads"];
-  // primary regex: number + keyword
-  const primary = new RegExp("(\\d{1,3}(?:[.,]\\d{3})*(?:[.,]\\d+)?)\\s*(?:" + keywords.join("|") + ")", "i");
-  const m = text.match(primary);
-  if (m && m[1]) {
-    return normalizeNumberString(m[1]);
-  }
-  // secondary: keyword then number (e.g., 'results: 123')
-  const secondary = new RegExp("(?:" + keywords.join("|") + ")[:\\s\\-]{0,8}(\\d{1,3}(?:[.,]\\d{3})*(?:[.,]\\d+)?)", "i");
-  const m2 = text.match(secondary);
-  if (m2 && m2[1]) {
-    return normalizeNumberString(m2[1]);
-  }
-  // neighbor-scan: find any number token near a keyword (within 60 chars)
-  const numTokenRegex = /\d{1,3}(?:[.,]\d{3})*(?:[.,]\d+)?/g;
-  for (const kw of keywords) {
-    let idx = text.toLowerCase().indexOf(kw);
-    while (idx >= 0) {
-      const start = Math.max(0, idx - 60);
-      const end = Math.min(text.length, idx + kw.length + 60);
-      const slice = text.slice(start, end);
-      const nums = slice.match(numTokenRegex);
-      if (nums && nums.length) {
-        // pick closest number to keyword by index distance
-        let best = null;
-        let bestDist = Infinity;
-        for (const n of nums) {
-          const nIdx = slice.indexOf(n);
-          const dist = Math.abs(nIdx - (idx - start));
-          if (dist < bestDist) {
-            bestDist = dist;
-            best = n;
-          }
-        }
-        if (best) return normalizeNumberString(best);
-      }
-      idx = text.toLowerCase().indexOf(kw, idx + 1);
-    }
-  }
-  // last resort: first reasonable number in text (avoid picking large unrelated numbers)
-  const generalNums = text.match(numTokenRegex);
-  if (generalNums && generalNums.length) {
-    // pick the longest token under a massive threshold (max 7 digits)
-    for (const n of generalNums) {
-      const digitsOnly = n.replace(/[^\d]/g, "");
-      if (digitsOnly.length <= 7) return normalizeNumberString(n);
-    }
-  }
-  return null;
-}
-
-function normalizeNumberString(s) {
-  if (!s || typeof s !== "string") return null;
-  // If contains both '.' and ',', assume '.' thousands and ',' decimals? common in pt: '1.234' or '1.234,56'
-  // Our target is integer counts; remove non-digits.
-  const digits = s.replace(/[^\d]/g, "");
-  if (!digits) return null;
-  const n = parseInt(digits, 10);
-  if (Number.isNaN(n)) return null;
-  return n;
-}
-
 async function saveDebug(pageOrHtml, offerId, note = "") {
   try {
     ensureDebugDir();
@@ -162,7 +96,6 @@ async function saveDebug(pageOrHtml, offerId, note = "") {
       await fs.promises.writeFile(htmlPath, `<!-- ${note} -->\n` + pageOrHtml, "utf8");
       return { htmlPath, pngPath: null };
     } else {
-      // page object
       const content = await pageOrHtml.content();
       await fs.promises.writeFile(htmlPath, `<!-- ${note} -->\n` + content, "utf8");
       try {
@@ -178,33 +111,24 @@ async function saveDebug(pageOrHtml, offerId, note = "") {
   }
 }
 
-// FAST PATH: fetch HTML raw with timeout and UA
-async function fastFetchExtract(url, ua) {
-  try {
-    const controller = new AbortController();
-    const id = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-    const res = await fetch(url, {
-      signal: controller.signal,
-      headers: {
-        "user-agent": ua,
-        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-      }
-    }).catch((e) => { throw e; });
-    clearTimeout(id);
-    if (!res || !res.ok) return { ok: false, reason: `fetch_status_${res ? res.status : "nores"}` };
-    const html = await res.text();
-    const count = extractCountFromText(html);
-    return { ok: !!count, count: count || null, html };
-  } catch (err) {
-    return { ok: false, reason: `fetch_error:${err?.name || err?.message || err}` };
+function parseCountFromText(text) {
+  if (!text || typeof text !== "string") return null;
+  const re = /(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d+)?)\s*(?:resultados|results)/i;
+  const m = text.match(re);
+  if (m && m[1]) {
+    const digits = m[1].replace(/[^\d]/g, "");
+    if (!digits) return null;
+    return parseInt(digits, 10);
   }
+  return null;
 }
 
-// Process offers slice in parallel batches
+// Main processing
 async function processOffers(offersSlice) {
   const browser = await chromium.launch({ headless: true });
   let consecutiveFails = 0;
   let consecutiveSuccess = 0;
+
   for (let i = 0; i < offersSlice.length; i += PARALLEL) {
     const batch = offersSlice.slice(i, i + PARALLEL);
     console.log(`📦 Processando bloco: ${Math.floor(i / PARALLEL) + 1} (${batch.length} ofertas)`);
@@ -213,36 +137,12 @@ async function processOffers(offersSlice) {
       if (!offer || !offer.adLibraryUrl) return;
       const globalIndex = i + idxInBatch;
       const { device, ua } = pickDeviceAndUA(globalIndex);
-
-      // FAST PATH
-      try {
-        const fast = await fastFetchExtract(offer.adLibraryUrl, ua);
-        if (fast.ok && fast.count != null) {
-          const activeAds = fast.count;
-          const updated_at = nowIso();
-          console.log(`⚡ [FAST] [${offer.id}] ${offer.offerName || ""}: ${activeAds} anúncios (UA short: ${(ua || "").slice(0,60)})`);
-          const { error } = await supabase
-            .from("swipe_file_offers")
-            .update({ activeAds, updated_at, status_updated: "success" })
-            .eq("id", offer.id);
-          if (error) console.warn(`[${offer.id}] DB update error (fast):`, error.message || error);
-          consecutiveSuccess++;
-          consecutiveFails = 0;
-          return;
-        } else {
-          // fast path miss: continue to fallback
-          console.log(`→ [FAST MISS] [${offer.id}] reason=${fast.reason || "no-match"} - fallback to Playwright`);
-        }
-      } catch (err) {
-        console.warn(`⚠️ [${offer.id}] fast-fetch exception:`, err?.message || err);
-      }
-
-      // FALLBACK: Playwright
       const contextOptions = { ...(device || {}) };
       if (ua) contextOptions.userAgent = ua;
+
       const context = await browser.newContext(contextOptions);
 
-      // Abort heavy resources
+      // Abort heavy resources to reduce HTML/RAM load
       await context.route("**/*", (route) => {
         const type = route.request().resourceType();
         if (["image", "stylesheet", "font", "media"].includes(type)) return route.abort();
@@ -250,50 +150,60 @@ async function processOffers(offersSlice) {
       });
 
       const page = await context.newPage();
-      let didSucceed = false;
-      try {
-        console.log(`⌛ [FALLBACK] [${offer.id}] Acessando (${device?.name || "custom"} / UA=${(ua || "").slice(0,60)}): ${offer.adLibraryUrl}`);
-        await page.goto(offer.adLibraryUrl, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT }).catch((e) => { throw e; });
 
-        // retries for dynamic content
-        let found = null;
-        for (let attempt = 1; attempt <= MAX_RETRIES && !found; attempt++) {
-          // Prefer visible text first
-          const bodyText = await page.textContent("body").catch(() => "");
-          found = extractCountFromText(bodyText || "");
-          if (!found) {
-            // fallback to HTML
-            const html = await page.content().catch(() => "");
-            found = extractCountFromText(html || "");
-          }
-          if (!found) {
-            if (attempt < MAX_RETRIES) {
-              console.log(`· [${offer.id}] fallback retry ${attempt}/${MAX_RETRIES} (waiting small)`);
-              await page.waitForTimeout(1000 + Math.floor(Math.random() * 800));
+      try {
+        console.log(`⌛ [${offer.id}] Acessando (${device?.name || "custom"} / UA=${(ua || "").slice(0,60)}): ${offer.adLibraryUrl}`);
+        await page.goto(offer.adLibraryUrl, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT });
+
+        // small wait to let on-page JS run if necessary; still small to keep speed
+        await page.waitForTimeout(WAIT_TIME + jitter(800));
+
+        // Try selector-first extraction, with up to RETRY_ATTEMPTS retries
+        let foundCount = null;
+        let attempt = 0;
+        const selectorString = 'text=/' + '(\\d{1,3}(?:[.,]\\d{3})*(?:[.,]\\d+)?)\\s*(?:resultados|results)' + '/i';
+        for (; attempt <= RETRY_ATTEMPTS && foundCount === null; attempt++) {
+          try {
+            // wait for the text matching the regex
+            const locator = page.locator(selectorString).first();
+            await locator.waitFor({ timeout: SELECTOR_TIMEOUT }).catch(() => { /* will handle below */ });
+            const text = await locator.textContent().catch(() => null);
+            if (text) {
+              const parsed = parseCountFromText(text);
+              if (parsed != null) {
+                foundCount = parsed;
+                console.log(`🔎 [${offer.id}] selector found on attempt ${attempt + 1}`);
+                break;
+              }
             }
+          } catch (e) {
+            // ignore, we'll retry if allowed
+          }
+          if (foundCount === null && attempt < RETRY_ATTEMPTS) {
+            console.log(`· [${offer.id}] selector not found, retry ${attempt + 1}/${RETRY_ATTEMPTS}`);
+            await page.waitForTimeout(1000 + Math.floor(Math.random() * 800));
           }
         }
 
         const updated_at = nowIso();
 
-        if (found != null) {
-          const activeAds = found;
-          console.log(`✅ [${offer.id}] ${offer.offerName || ""}: ${activeAds} anúncios (fallback)`);
+        if (foundCount != null) {
+          const activeAds = foundCount;
+          console.log(`✅ [${offer.id}] ${offer.offerName || "offer"}: ${activeAds} anúncios`);
           const { error } = await supabase
             .from("swipe_file_offers")
             .update({ activeAds, updated_at, status_updated: "success" })
             .eq("id", offer.id);
-          if (error) console.warn(`[${offer.id}] DB update error (fallback):`, error.message || error);
-          didSucceed = true;
+          if (error) console.warn(`[${offer.id}] Erro ao atualizar DB:`, error.message || error);
           consecutiveSuccess++;
           consecutiveFails = 0;
         } else {
-          console.warn(`❌ [${offer.id}] contador não encontrado (fallback) — salvando debug`);
+          console.warn(`❌ [${offer.id}] contador não encontrado pelo selector após ${RETRY_ATTEMPTS + 1} tentativas — salvando debug`);
           try {
-            const dbg = await saveDebug(page, offer.id, "no-counter-fallback");
-            console.log(`[${offer.id}] debug saved: ${dbg.htmlPath || "no-html"} ${dbg.pngPath || ""}`);
+            const dbg = await saveDebug(page, offer.id, "no-counter-selector");
+            console.log(`[${offer.id}] debug salvo: ${dbg.htmlPath || "no-html"} ${dbg.pngPath || ""}`);
           } catch (e) {
-            console.warn(`[${offer.id}] failed saving debug:`, e?.message || e);
+            console.warn(`[${offer.id}] falha ao salvar debug:`, e?.message || e);
           }
           await supabase
             .from("swipe_file_offers")
@@ -303,16 +213,16 @@ async function processOffers(offersSlice) {
           consecutiveFails++;
         }
       } catch (err) {
-        console.error(`🚫 [${offer.id}] Erro no fallback:`, err?.message || err);
-        // Try to save debug HTML if possible
+        console.error(`🚫 [${offer.id}] Erro ao processar:`, err?.message || err);
+        // Save debug page content if possible
         try {
-          const dbgHtml = await page.content().catch(() => null);
-          if (dbgHtml) {
-            const dbg = await saveDebug(dbgHtml, offer.id, `fallback-exception-${String(err?.message || err)}`);
-            console.log(`[${offer.id}] debug saved after exception: ${dbg.htmlPath || "no-html"}`);
+          const html = await page.content().catch(() => null);
+          if (html) {
+            const dbg = await saveDebug(html, offer.id, `exception-${String(err?.message || err)}`);
+            console.log(`[${offer.id}] debug salvo após exception: ${dbg.htmlPath || "no-html"}`);
           }
         } catch (e) {
-          console.warn(`[${offer.id}] falha ao salvar debug no exception:`, e?.message || e);
+          console.warn(`[${offer.id}] falha ao salvar debug na exception:`, e?.message || e);
         }
         try {
           await supabase
@@ -328,8 +238,6 @@ async function processOffers(offersSlice) {
         try { await context.close(); } catch {}
         await sleep(400 + jitter(900));
       }
-
-      // adaptive per-offer behaviour done above
     }));
 
     // adaptive throttling
@@ -342,7 +250,6 @@ async function processOffers(offersSlice) {
       consecutiveSuccess = 0;
     }
 
-    // small pause between batches
     await sleep(500 + jitter(1000));
   }
 
