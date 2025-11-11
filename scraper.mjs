@@ -20,8 +20,10 @@
  * USO SUGERIDO PARA DEBUG:
  * WORKER_INDEX=0 TOTAL_WORKERS=1 PARALLEL=1 PROCESS_LIMIT=5 DEBUG=true node scraper.mjs
  *
- * Nota: Esta versão garante que, após esgotados os retries desta execução,
- * o campo activeAds é definido como null (ou seja, imediatamente quando a extração falha).
+ * Nota: Esta versão garante que:
+ *  - após esgotados os retries desta execução, activeAds = null é gravado;
+ *  - quando confirmar blocked_ip, também grava activeAds = null;
+ *  - quando uma oferta vier do DB com status_updated === null, marcamos activeAds = null imediatamente.
  */
 
 import fs from "fs";
@@ -267,6 +269,27 @@ async function processOffers(offersSlice) {
       await Promise.all(batch.map(async (offer) => {
         if (!offer || !offer.adLibraryUrl) return;
 
+        // NEW: se status_updated for NULL no registro, setar activeAds = null imediatamente (marcar erro)
+        try {
+          if (offer.status_updated === null || offer.status_updated === undefined) {
+            const currentAttempts = Number(offer.attempts ?? 0) + 1;
+            logInfo(`[${offer.id}] status_updated=null detectado -> marcando activeAds=null e status_updated='erro' (attempts=${currentAttempts})`);
+            try {
+              const { data: missingData, error: missingErr } = await supabase
+                .from("swipe_file_offers")
+                .update({ activeAds: null, updated_at: nowIso(), status_updated: "erro", attempts: currentAttempts })
+                .eq("id", offer.id);
+              if (missingErr) logWarn(`[${offer.id}] Falha ao marcar activeAds=null para status_updated=null: ${missingErr.message || JSON.stringify(missingErr)}`);
+              else logInfo(`[${offer.id}] activeAds=null gravado para registro com status_updated=null (db rows=${(missingData||[]).length})`);
+            } catch (e) {
+              logWarn(`[${offer.id}] Exceção ao gravar activeAds=null para status_updated=null: ${String(e?.message || e)}`);
+            }
+            // Continuamos com o processamento normal: se extração tiver sucesso, sobrescreve esse null.
+          }
+        } catch (e) {
+          logWarn(`[${offer.id}] Erro ao checar status_updated null: ${String(e?.message || e)}`);
+        }
+
         // 1) Pick context: random from pool, occasionally create a temp context for diversity
         let ctxIndex, context;
         let isTempContext = false;
@@ -388,14 +411,14 @@ async function processOffers(offersSlice) {
                 blockedCount = 0;
               }
               try {
-                // Note: we keep marking blocked_ip; we DO NOT change this behavior unless requested.
-                logInfo(`[${offer.id}] marcando status_updated=blocked_ip (bloqueio confirmado)`);
+                // Note: agora também gravamos activeAds = null ao marcar blocked_ip
+                logInfo(`[${offer.id}] marcando status_updated=blocked_ip e activeAds=null (bloqueio confirmado)`);
                 const { data: blockData, error: blockErr } = await supabase
                   .from("swipe_file_offers")
-                  .update({ updated_at: nowIso(), status_updated: "blocked_ip" })
+                  .update({ activeAds: null, updated_at: nowIso(), status_updated: "blocked_ip", attempts: Number(offer.attempts ?? 0) + 1 })
                   .eq("id", offer.id);
-                if (blockErr) logWarn(`[${offer.id}] Erro ao marcar blocked_ip no DB: ${blockErr.message || JSON.stringify(blockErr)}`);
-                else logInfo(`[${offer.id}] marcado blocked_ip (db response rows=${(blockData||[]).length})`);
+                if (blockErr) logWarn(`[${offer.id}] Erro ao marcar blocked_ip+null no DB: ${blockErr.message || JSON.stringify(blockErr)}`);
+                else logInfo(`[${offer.id}] marcado blocked_ip e activeAds=null (db rows=${(blockData||[]).length})`);
               } catch (e) {
                 logWarn(`[${offer.id}] Erro DB ao marcar blocked_ip: ${String(e?.message || e)}`);
               }
