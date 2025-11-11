@@ -1,25 +1,27 @@
 name: FB Ads Scraper Diário
 
-# Permissões necessárias para que o job consiga push com GITHUB_TOKEN
+# Permissões para permitir push para branch debug-artifacts via GITHUB_TOKEN
 permissions:
   contents: write
 
 on:
   schedule:
-    # Rodar todo dia às 7h da manhã (UTC-3 → 10h UTC)
     - cron: '0 10 * * *'
-  workflow_dispatch: # permite rodar manualmente
+  workflow_dispatch:
 
 jobs:
   scraper:
     runs-on: ubuntu-latest
 
+    strategy:
+      matrix:
+        batch_id: [1,2,3,4] # TOTAL_BATCHES=4 (mude aqui para 8 se quiser mais batches)
+
     steps:
-      - name: Checkout do repositório
+      - name: Checkout repository
         uses: actions/checkout@v3
         with:
           fetch-depth: 0
-          # garante que o token esteja disponível para operações git
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup Node.js 20
@@ -51,28 +53,26 @@ jobs:
       - name: Instalar navegadores Playwright
         run: npx playwright install --with-deps chromium
 
-      - name: Rodar Scraper
+      - name: Rodar Scraper (batch ${{ matrix.batch_id }})
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-          # Variáveis opcionais de sharding/cuidados:
-          # TOTAL_BATCHES, BATCH_ID, PROCESS_LIMIT, PARALLEL, etc.
+          TOTAL_BATCHES: 4
+          BATCH_ID: ${{ matrix.batch_id }}
+          PROCESS_LIMIT: 150
+          PARALLEL: 5
         run: node scraper.mjs
 
-      # --- passos adicionais para debugar e persistir arquivos debug ---
       - name: Listar arquivos debug (imprime nomes e primeiras linhas dos .html)
         if: always()
         run: |
           echo "Runner workspace: $RUNNER_WORKSPACE"
-          echo "Debug path (relativo): ./debug"
-          echo "Debug path (abs): $RUNNER_WORKSPACE/debug"
+          echo "Debug path: ./debug"
           if [ -d "./debug" ]; then
-            echo "== Conteúdo da pasta ./debug =="
             ls -la ./debug || true
-            echo "== Primeiras linhas dos HTMLs (até 200 linhas por arquivo) =="
             for f in ./debug/*; do
               if [ -f "$f" ]; then
-                echo "---- ARQUIVO: $f ----"
+                echo "---- $f ----"
                 case "$f" in
                   *.html) sed -n '1,200p' "$f" || true ;;
                   *.png) echo "(imagem PNG) $f" ;;
@@ -89,7 +89,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: debug-${{ github.run_id }}
+          name: debug-${{ github.run_id }}-batch-${{ matrix.batch_id }}
           path: debug
           retention-days: 1
 
@@ -99,52 +99,31 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-
-          # Se não houver debug, sair sem erro
           if [ ! -d "./debug" ]; then
-            echo "Não há pasta ./debug para commitar. Nenhuma ação necessária."
+            echo "Não há pasta ./debug para commitar. Saindo."
             exit 0
           fi
-
-          # Copiar debug para um tmp para preservar antes de trocar branch
           tmpdir=$(mktemp -d)
-          echo "Copiando ./debug para $tmpdir/debug"
           cp -r ./debug "$tmpdir"/debug || true
-
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          # Buscar referência remota
           git fetch origin
-
-          # Se branch existir, pegar ela; caso contrário criar um orphan branch
           if git ls-remote --exit-code --heads origin debug-artifacts; then
-            echo "Branch debug-artifacts existe — checkout para atualização"
             git checkout -B debug-artifacts origin/debug-artifacts
-            # remover arquivos atuais do branch (será substituído)
             git rm -rf . || true
           else
-            echo "Branch debug-artifacts não existe — criando branch orphan"
             git checkout --orphan debug-artifacts
-            # remover arquivos do working tree
             git rm -rf . || true
           fi
-
-          # copiar os arquivos salvos no tmp para o repo
           mkdir -p debug
-          # Se o tmp contém apenas uma pasta debug, movemos seu conteúdo
           if [ -d "$tmpdir/debug" ]; then
             cp -r "$tmpdir"/debug/* debug/ || true
           fi
-
-          # Add e commit somente se houver mudanças
           git add -A debug || true
-
           if git diff --cached --quiet; then
             echo "Sem mudanças a commitar no branch debug-artifacts"
           else
-            git commit -m "chore(debug): upload debug artifacts for run $GITHUB_RUN_ID"
-            # Forçar push substituindo o estado do branch (sobrescreve o conteúdo)
+            git commit -m "chore(debug): upload debug artifacts for run $GITHUB_RUN_ID batch ${MATRIX_BATCH_ID:-${{ matrix.batch_id }}}"
             git push --force "https://${GITHUB_ACTOR}:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git" HEAD:debug-artifacts
             echo "Push para branch debug-artifacts concluído."
           fi
