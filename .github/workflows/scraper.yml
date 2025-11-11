@@ -9,7 +9,7 @@ jobs:
   scraper-workers:
     runs-on: ubuntu-latest
     container:
-      image: mcr.microsoft.com/playwright:v1.42.0-jammy
+      image: mcr.microsoft.com/playwright:v1.56.1-jammy
       options: --shm-size=1g
 
     strategy:
@@ -30,8 +30,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-node@v4
         with:
           node-version: 20
+
       - run: npm ci --prefer-offline
+
       - run: node scraper.mjs
