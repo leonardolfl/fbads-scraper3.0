@@ -448,7 +448,7 @@ async function processOffers(offersSlice) {
             consecutiveFails = 0;
             blockedCount = 0;
           } else {
-            // not found after retry -> mark erro (red X) and increment attempts
+            // not found after retries -> mark erro (red X) and increment attempts
             logWarn(`❌ [${offer.id}] contador não encontrado após retry(s) — marcando erro (X vermelho) e incrementando attempts`);
             try {
               const html = DEBUG ? (htmlContent || await page.content().catch(() => null)) : null;
@@ -463,22 +463,13 @@ async function processOffers(offersSlice) {
             const currentAttempts = Number(offer.attempts ?? 0);
             const newAttempts = currentAttempts + 1;
             try {
-              // set status_updated = "erro" so UI shows red X; attempts incremented, activeAds set to null only after MAX_FAILS as before
-              if (newAttempts >= MAX_FAILS) {
-                const { error } = await supabase
-                  .from("swipe_file_offers")
-                  .update({ activeAds: null, updated_at, status_updated: "erro", attempts: newAttempts })
-                  .eq("id", offer.id);
-                if (error) logWarn(`[${offer.id}] DB update (final erro) error: ${error.message || error}`);
-                else logInfo(`[${offer.id}] marcado erro final após ${newAttempts} tentativas`);
-              } else {
-                const { error } = await supabase
-                  .from("swipe_file_offers")
-                  .update({ updated_at, status_updated: "erro", attempts: newAttempts })
-                  .eq("id", offer.id);
-                if (error) logWarn(`[${offer.id}] DB update (increment attempts) error: ${error.message || error}`);
-                else logInfo(`[${offer.id}] incrementado attempts -> ${newAttempts} e marcado erro`);
-              }
+              // ALTERAÇÃO CIRÚRGICA: sempre setar activeAds = null após os retries desta execução
+              const { error } = await supabase
+                .from("swipe_file_offers")
+                .update({ activeAds: null, updated_at, status_updated: "erro", attempts: newAttempts })
+                .eq("id", offer.id);
+              if (error) logWarn(`[${offer.id}] DB update (final erro) error: ${error.message || error}`);
+              else logInfo(`[${offer.id}] marcado erro e activeAds=null após ${newAttempts} tentativas`);
             } catch (e) {
               logWarn(`[${offer.id}] Erro ao atualizar attempts/status: ${String(e?.message || e)}`);
             }
