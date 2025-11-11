@@ -22,21 +22,22 @@ async function main() {
     process.exit(0);
   }
 
+  // Mantém null literal (não string)
   const formatted = {
     version: new Date().toISOString().slice(0, 10),
     offers: offers.map((o) => ({
-      id: o.id,
-      offerName: o.offerName,
-      niche: o.niche || "",
-      activeAds: o.activeAds ?? 0,
-      location: o.location || "",
-      funnel: o.funnel || "",
-      deliverable: o.deliverable || "",
-      ticket: o.ticket || "",
-      dateAdded: o.dateAdded || o.created_at || null,
-      adLibraryUrl: o.adLibraryUrl || "",
-      pageUrl: o.pageUrl || "",
-      checkoutUrl: o.checkoutUrl || "",
+      id: o.id ?? null,
+      offerName: o.offerName ?? null,
+      niche: o.niche ?? null,
+      activeAds: typeof o.activeAds === "number" ? o.activeAds : null,
+      location: o.location ?? null,
+      funnel: o.funnel ?? null,
+      deliverable: o.deliverable ?? null,
+      ticket: o.ticket ?? null,
+      dateAdded: o.dateAdded ?? o.created_at ?? null,
+      adLibraryUrl: o.adLibraryUrl ?? null,
+      pageUrl: o.pageUrl ?? null,
+      checkoutUrl: o.checkoutUrl ?? null,
     })),
   };
 
