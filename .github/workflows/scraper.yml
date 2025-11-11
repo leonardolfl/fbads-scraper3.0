@@ -2,7 +2,6 @@ name: FB Ads Scraper Diário
 
 on:
   schedule:
-    # Rodar todo dia às 7h da manhã (UTC-3 → 10h UTC)
     - cron: '0 10 * * *'
   workflow_dispatch:
 
@@ -10,7 +9,7 @@ jobs:
   scraper-workers:
     runs-on: ubuntu-latest
     container:
-      image: mcr.microsoft.com/playwright:latest
+      image: mcr.microsoft.com/playwright:v1.42.0-jammy
       options: --shm-size=1g
 
     strategy:
@@ -30,16 +29,9 @@ jobs:
       LOG_LEVEL: info
 
     steps:
-      - name: Checkout código
-        uses: actions/checkout@v4
-
-      - name: Configurar Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 20
-
-      - name: Instalar dependências
-        run: npm ci --prefer-offline
-
-      - name: Executar scraper
-        run: node scraper.mjs
+      - run: npm ci --prefer-offline
+      - run: node scraper.mjs
