@@ -2,20 +2,20 @@ name: FB Ads Scraper Diário
 
 on:
   schedule:
-    # Rodar todo dia às 7h da manhã (UTC-3 → 10h UTC)
+    # Roda todo dia às 7h da manhã (UTC-3 → 10h UTC)
     - cron: '0 10 * * *'
   workflow_dispatch: # permite rodar manualmente
 
 jobs:
   scraper-workers:
     runs-on: ubuntu-latest
+    container:
+      image: mcr.microsoft.com/playwright:latest
+      options: --shm-size=1g
+
     strategy:
       matrix:
-        worker_index: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
-                       10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
-                       20, 21, 22, 23, 24, 25, 26, 27, 28, 29,
-                       30, 31, 32, 33, 34, 35, 36, 37, 38, 39,
-                       40, 41, 42, 43, 44, 45, 46, 47, 48, 49]
+        worker_index: ${{ fromJSON('[' + join(fromJSON('[' + range(0,50) + ']'), ',') + ']') }}
       fail-fast: false
 
     env:
@@ -23,12 +23,19 @@ jobs:
       WORKER_INDEX: ${{ matrix.worker_index }}
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+      LOG_LEVEL: info
 
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-node@v3
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Configurar Node.js
+        uses: actions/setup-node@v4
         with:
           node-version: 20
-      - run: npm ci
-      - run: npx playwright install --with-deps chromium
-      - run: node scraper.mjs
+
+      - name: Instalar dependências
+        run: npm ci --prefer-offline
+
+      - name: Executar scraper
+        run: node scraper.mjs
