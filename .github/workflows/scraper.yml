@@ -1,6 +1,6 @@
 name: FB Ads Scraper Diário
 
-# Permissões para permitir push para branch debug-artifacts via GITHUB_TOKEN
+# Permissões necessárias para que o job consiga push com GITHUB_TOKEN
 permissions:
   contents: write
 
@@ -15,10 +15,10 @@ jobs:
 
     strategy:
       matrix:
-        batch_id: [1,2,3,4] # TOTAL_BATCHES=4 (mude aqui para 8 se quiser mais batches)
+        batch_id: [1,2,3,4] # TOTAL_BATCHES=4 (mude para 8 se quiser aumentar)
 
     steps:
-      - name: Checkout repository
+      - name: Checkout do repositório
         uses: actions/checkout@v3
         with:
           fetch-depth: 0
