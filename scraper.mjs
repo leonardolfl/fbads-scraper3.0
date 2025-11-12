@@ -44,7 +44,7 @@ const NEW_CONTEXT_PROB = parseFloat(process.env.NEW_CONTEXT_PROB || "0.05"); // 
 const WAIT_TIME = parseInt(process.env.WAIT_TIME || "4000", 10); // increased per request
 const NAV_TIMEOUT = parseInt(process.env.NAV_TIMEOUT || "60000", 10);
 const SELECTOR_TIMEOUT = parseInt(process.env.SELECTOR_TIMEOUT || "10000", 10);
-const RETRY_ATTEMPTS = Math.max(0, parseInt(process.env.RETRY_ATTEMPTS || "1", 10)); // requested =1
+const RETRY_ATTEMPTS = 0; // requested =1
 
 const DEBUG = String(process.env.DEBUG || "false").toLowerCase() === "true";
 const LOG_LEVEL = (process.env.LOG_LEVEL || "info").toLowerCase(); // info|warn|error|silent
@@ -427,24 +427,6 @@ async function processOffers(offersSlice) {
               return;
             }
           } // end initial blocked handling
-
-          // If not found and no confirmed block, perform RETRY_ATTEMPTS (1) by reloading the page once
-          let attemptIndex = 0;
-          for (; attemptIndex <= RETRY_ATTEMPTS && !result.found; attemptIndex++) {
-            if (attemptIndex === 0) {
-              // already tried; if not found, we will retry
-            } else {
-              logInfo(`[${offer.id}] Tentativa de retry ${attemptIndex}/${RETRY_ATTEMPTS}`);
-              try {
-                await page.reload({ waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT }).catch(() => null);
-                await page.waitForTimeout(WAIT_TIME + jitter(400));
-                result = await attemptExtractFromPage(page, offer);
-                if (result.found) logInfo(`[${offer.id}] retry ${attemptIndex} extraiu: ${result.count}`);
-              } catch (e) {
-                logWarn(`[${offer.id}] retry ${attemptIndex} erro: ${String(e?.message || e)}`);
-              }
-            }
-          }
 
           // After retries, if still not found -> mark as erro (X vermelho) and increment attempts
           const updated_at = nowIso();
