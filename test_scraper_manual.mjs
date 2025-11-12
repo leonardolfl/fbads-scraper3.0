@@ -1,55 +1,56 @@
-/**
- * test_scraper_manual.mjs
- *
- * Agora lê do Supabase (tabela swipe_file_offers) apenas ofertas com activeAds IS NULL.
- * Para cada oferta:
- *  - Extrai número de anúncios ativos do Facebook Ad Library
- *  - Se encontrar, atualiza activeAds, status_updated='success', attempts=0, updated_at=now()
- *  - Se não encontrar, apenas loga aviso
- *
- * Pode rodar com múltiplos runners (TOTAL_WORKERS / WORKER_INDEX)
- */
+#!/usr/bin/env node
 
 import fs from "fs";
-import { chromium, devices } from "playwright";
+import { chromium } from "playwright";
 import { supabase } from "./supabase.js";
 
+const WAIT_TIME = 7000; // tempo de renderização
+const NAV_TIMEOUT = 60000;
+const PARALLEL = 3; // processar 3 em paralelo
+const DEBUG = String(process.env.DEBUG || "false").toLowerCase() === "true";
+const DEBUG_DIR = "./debug_manual";
 const TOTAL_WORKERS = parseInt(process.env.TOTAL_WORKERS || "2", 10);
 const WORKER_INDEX = parseInt(process.env.WORKER_INDEX ?? "0", 10);
-const WAIT_TIME = 15000;
-const NAV_TIMEOUT = 90000;
-const SELECTOR_TIMEOUT = 15000;
-const DEBUG_DIR = "./debug_manual";
 
-if (!fs.existsSync(DEBUG_DIR)) fs.mkdirSync(DEBUG_DIR, { recursive: true });
+function nowIso() {
+  return new Date().toISOString();
+}
+function sleep(ms) {
+  return new Promise((res) => setTimeout(res, ms));
+}
 
-// apenas dispositivos MOBILE
-const DEVICE_NAMES = ["iPhone 13 Pro Max", "Pixel 7", "Galaxy S21 Ultra"];
-const DEVICE_POOL = DEVICE_NAMES.map(n => devices[n]).filter(Boolean);
+async function ensureDebugDir() {
+  if (!DEBUG) return;
+  if (!fs.existsSync(DEBUG_DIR)) fs.mkdirSync(DEBUG_DIR, { recursive: true });
+}
 
-const USER_AGENTS = [
-  "Mozilla/5.0 (iPhone; CPU iPhone OS 17_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Mobile/15E148 Safari/604.1",
-  "Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Mobile Safari/537.36",
-];
+async function createFastContext(browser) {
+  const context = await browser.newContext({
+    userAgent:
+      "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+    viewport: { width: 430, height: 932 },
+    deviceScaleFactor: 2,
+    isMobile: true,
+    hasTouch: true,
+  });
 
-const CANDIDATE_SELECTORS = [
-  'div[role="heading"][aria-level="3"]',
-  'div[role="heading"]',
-  'h3', 'h2',
-  'div:has-text("resultados")',
-  'span:has-text("resultados")',
-  'div:has-text("results")',
-  'span:has-text("results")',
-  'div[class*="counter"]',
-  'div[class*="results"]',
-  'span[class*="results"]',
-];
+  // Bloquear recursos pesados
+  await context.route("**/*", (route) => {
+    const type = route.request().resourceType();
+    if (["image", "stylesheet", "font", "media"].includes(type)) {
+      return route.abort();
+    }
+    return route.continue();
+  });
+
+  return context;
+}
 
 function parseCountFromText(text) {
   if (!text) return null;
-  let m = text.match(/~\s*([0-9.,]+)/) ||
-          text.match(/([\d\.,\s\u00A0\u202F]+)\s*(?:resultados|results|anúncios|anuncios)/i) ||
-          text.match(/([0-9][0-9\.,\s\u00A0\u202F]{0,})/);
+  const m =
+    text.match(/~\s*([0-9.,]+)/) ||
+    text.match(/([\d\.,\s\u00A0\u202F]+)\s*(?:resultados|results)/i);
   if (m && m[1]) {
     const cleaned = m[1].replace(/[.,\s\u00A0\u202F]/g, "");
     const n = parseInt(cleaned, 10);
@@ -59,90 +60,137 @@ function parseCountFromText(text) {
 }
 
 async function attemptExtract(page) {
-  for (const sel of CANDIDATE_SELECTORS) {
+  const selectors = [
+    'div[role="heading"][aria-level="3"]',
+    'h3',
+    'div[data-pagelet="root"] h3',
+  ];
+
+  for (const sel of selectors) {
     try {
-      const txt = await page.locator(sel).first().textContent({ timeout: SELECTOR_TIMEOUT }).catch(() => null);
-      if (txt) {
-        const parsed = parseCountFromText(txt);
-        if (parsed != null) return { found: true, count: parsed, selector: sel, raw: txt };
-      }
-    } catch {}
+      const el = await page.locator(sel).first();
+      const txt = await el.textContent({ timeout: 3000 });
+      const parsed = parseCountFromText(txt);
+      if (parsed) return { found: true, count: parsed, selector: sel };
+    } catch (e) {}
   }
+
+  // fallback: leitura geral
+  try {
+    const html = await page.content();
+    const parsed = parseCountFromText(html);
+    if (parsed) return { found: true, count: parsed, selector: "html-fallback" };
+  } catch (e) {}
+
   return { found: false };
 }
 
-(async () => {
-  console.log(`🚀 Iniciando leitura do Supabase (worker ${WORKER_INDEX}/${TOTAL_WORKERS})`);
+async function main() {
+  console.log("🚀 Iniciando leitura de ofertas com activeAds = NULL...");
+  await ensureDebugDir();
 
+  // Buscar ofertas null no banco
   const { data: offersAll, error } = await supabase
     .from("swipe_file_offers")
-    .select("id, \"adLibraryUrl\", attempts")
+    .select("*")
     .is("activeAds", null)
     .is("deleted_at", null)
     .order("id", { ascending: true });
 
   if (error) {
-    console.error("❌ Erro ao buscar ofertas:", error);
+    console.error("Erro ao buscar ofertas null:", error.message);
     process.exit(1);
   }
 
-  if (!offersAll?.length) {
-    console.log("✅ Nenhuma oferta com activeAds NULL encontrada.");
+  if (!offersAll || offersAll.length === 0) {
+    console.log("✅ Nenhuma oferta null encontrada. Encerrando.");
     process.exit(0);
   }
 
-  // dividir entre runners
   const total = offersAll.length;
   const chunkSize = Math.ceil(total / TOTAL_WORKERS);
-  const myOffers = offersAll.slice(WORKER_INDEX * chunkSize, Math.min((WORKER_INDEX + 1) * chunkSize, total));
+  const myOffers = offersAll.slice(
+    WORKER_INDEX * chunkSize,
+    (WORKER_INDEX + 1) * chunkSize
+  );
 
-  console.log(`🔹 Worker ${WORKER_INDEX} processando ${myOffers.length}/${total} ofertas`);
+  console.log(
+    `🧩 Worker ${WORKER_INDEX}/${TOTAL_WORKERS} processando ${myOffers.length}/${total} ofertas`
+  );
 
-  const browser = await chromium.launch({ headless: true, args: ["--no-sandbox"] });
-  const context = await browser.newContext({
-    ...(DEVICE_POOL[Math.floor(Math.random() * DEVICE_POOL.length)]),
-    userAgent: USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)]
+  const browser = await chromium.launch({
+    headless: true,
+    args: ["--no-sandbox", "--disable-setuid-sandbox"],
   });
-  const page = await context.newPage();
+  const context = await createFastContext(browser);
 
-  for (const offer of myOffers) {
-    const url = offer.adLibraryUrl;
-    if (!url) {
-      console.log(`⚠️ [${offer.id}] sem adLibraryUrl`);
-      continue;
+  try {
+    for (let i = 0; i < myOffers.length; i += PARALLEL) {
+      const batch = myOffers.slice(i, i + PARALLEL);
+
+      await Promise.all(
+        batch.map(async (offer) => {
+          const url = offer.adLibraryUrl;
+          if (!url) {
+            console.log(`⚠️ [${offer.id}] sem adLibraryUrl`);
+            return;
+          }
+
+          const page = await context.newPage();
+          console.log(`\n🔗 [${offer.id}] Testando: ${url}`);
+
+          try {
+            await page.goto(url, {
+              waitUntil: "domcontentloaded",
+              timeout: NAV_TIMEOUT,
+            });
+            await page.waitForTimeout(WAIT_TIME);
+            const result = await attemptExtract(page);
+
+            if (result.found) {
+              console.log(
+                `✅ [${offer.id}] ${result.count} anúncios encontrados (${result.selector})`
+              );
+              const { error: updateError } = await supabase
+                .from("swipe_file_offers")
+                .update({
+                  activeAds: result.count,
+                  status_updated: "success",
+                  attempts: 0,
+                  updated_at: nowIso(),
+                })
+                .eq("id", offer.id);
+
+              if (updateError)
+                console.log(
+                  `⚠️ [${offer.id}] erro ao atualizar: ${updateError.message}`
+                );
+            } else {
+              console.log(`⚠️ [${offer.id}] nenhum número encontrado`);
+              if (DEBUG) {
+                const html = await page.content();
+                const file = `${DEBUG_DIR}/debug-${offer.id}.html`;
+                await fs.promises.writeFile(file, html, "utf8");
+              }
+            }
+          } catch (e) {
+            console.log(`💥 [${offer.id}] erro: ${e.message}`);
+          } finally {
+            await page.close();
+          }
+        })
+      );
+      await sleep(200);
     }
-
-    console.log(`\n🔗 [${offer.id}] Testando: ${url}`);
-    try {
-      await page.goto(url, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT });
-      await page.waitForTimeout(WAIT_TIME);
-      const result = await attemptExtract(page);
-
-      if (result.found) {
-        console.log(`✅ [${offer.id}] ${result.count} anúncios encontrados (sel: ${result.selector})`);
-
-        const { error: updateError } = await supabase
-          .from("swipe_file_offers")
-          .update({
-            activeAds: result.count,
-            status_updated: "success",
-            attempts: 0,
-            updated_at: new Date().toISOString()
-          })
-          .eq("id", offer.id);
-
-        if (updateError) console.log(`⚠️ [${offer.id}] erro ao atualizar: ${updateError.message}`);
-      } else {
-        console.log(`⚠️ [${offer.id}] nenhum número encontrado`);
-        const html = await page.content();
-        await fs.promises.writeFile(`${DEBUG_DIR}/debug-${offer.id}.html`, html, "utf8");
-      }
-
-    } catch (e) {
-      console.log(`💥 [${offer.id}] erro: ${e.message}`);
-    }
+  } finally {
+    await context.close();
+    await browser.close();
   }
 
-  await browser.close();
-  console.log("\n✅ Worker finalizado com sucesso.");
-})();
+  console.log("🏁 Worker finalizado.");
+}
+
+main().catch((e) => {
+  console.error("Erro fatal:", e);
+  process.exit(1);
+});
