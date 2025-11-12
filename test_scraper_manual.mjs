@@ -1,31 +1,35 @@
 /**
  * test_scraper_manual.mjs
- * Testa manualmente scraping do número de anúncios do Facebook Ad Library.
- * Usa seletores expandidos, dispositivos mobile e salva HTML para debug.
+ *
+ * Agora lê do Supabase (tabela swipe_file_offers) apenas ofertas com activeAds IS NULL.
+ * Para cada oferta:
+ *  - Extrai número de anúncios ativos do Facebook Ad Library
+ *  - Se encontrar, atualiza activeAds, status_updated='success', attempts=0, updated_at=now()
+ *  - Se não encontrar, apenas loga aviso
+ *
+ * Pode rodar com múltiplos runners (TOTAL_WORKERS / WORKER_INDEX)
  */
 
 import fs from "fs";
-import path from "path";
 import { chromium, devices } from "playwright";
+import { supabase } from "./supabase.js";
 
+const TOTAL_WORKERS = parseInt(process.env.TOTAL_WORKERS || "2", 10);
+const WORKER_INDEX = parseInt(process.env.WORKER_INDEX ?? "0", 10);
 const WAIT_TIME = 15000;
 const NAV_TIMEOUT = 90000;
 const SELECTOR_TIMEOUT = 15000;
-
 const DEBUG_DIR = "./debug_manual";
+
 if (!fs.existsSync(DEBUG_DIR)) fs.mkdirSync(DEBUG_DIR, { recursive: true });
 
+// apenas dispositivos MOBILE
 const DEVICE_NAMES = ["iPhone 13 Pro Max", "Pixel 7", "Galaxy S21 Ultra"];
 const DEVICE_POOL = DEVICE_NAMES.map(n => devices[n]).filter(Boolean);
+
 const USER_AGENTS = [
   "Mozilla/5.0 (iPhone; CPU iPhone OS 17_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Mobile/15E148 Safari/604.1",
   "Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Mobile Safari/537.36",
-];
-
-const LINKS = [
-  "https://www.facebook.com/ads/library/?active_status=active&ad_type=all&country=ALL&is_targeted_country=false&media_type=all&search_type=page&view_all_page_id=198128936727398",
-  "https://www.facebook.com/ads/library/?active_status=active&ad_type=all&country=ALL&is_targeted_country=false&media_type=all&search_type=page&source=page-transparency-widget&view_all_page_id=149229165196898",
-  "https://www.facebook.com/ads/library/?active_status=active&ad_type=all&country=ALL&is_targeted_country=false&media_type=all&search_type=page&source=page-transparency-widget&view_all_page_id=100991206258839"
 ];
 
 const CANDIDATE_SELECTORS = [
@@ -68,7 +72,32 @@ async function attemptExtract(page) {
 }
 
 (async () => {
-  console.log(`🚀 Iniciando teste manual com ${LINKS.length} links...`);
+  console.log(`🚀 Iniciando leitura do Supabase (worker ${WORKER_INDEX}/${TOTAL_WORKERS})`);
+
+  const { data: offersAll, error } = await supabase
+    .from("swipe_file_offers")
+    .select("id, \"adLibraryUrl\", attempts")
+    .is("activeAds", null)
+    .is("deleted_at", null)
+    .order("id", { ascending: true });
+
+  if (error) {
+    console.error("❌ Erro ao buscar ofertas:", error);
+    process.exit(1);
+  }
+
+  if (!offersAll?.length) {
+    console.log("✅ Nenhuma oferta com activeAds NULL encontrada.");
+    process.exit(0);
+  }
+
+  // dividir entre runners
+  const total = offersAll.length;
+  const chunkSize = Math.ceil(total / TOTAL_WORKERS);
+  const myOffers = offersAll.slice(WORKER_INDEX * chunkSize, Math.min((WORKER_INDEX + 1) * chunkSize, total));
+
+  console.log(`🔹 Worker ${WORKER_INDEX} processando ${myOffers.length}/${total} ofertas`);
+
   const browser = await chromium.launch({ headless: true, args: ["--no-sandbox"] });
   const context = await browser.newContext({
     ...(DEVICE_POOL[Math.floor(Math.random() * DEVICE_POOL.length)]),
@@ -76,27 +105,44 @@ async function attemptExtract(page) {
   });
   const page = await context.newPage();
 
-  for (const url of LINKS) {
-    console.log(`\n🔗 Testando: ${url}`);
+  for (const offer of myOffers) {
+    const url = offer.adLibraryUrl;
+    if (!url) {
+      console.log(`⚠️ [${offer.id}] sem adLibraryUrl`);
+      continue;
+    }
+
+    console.log(`\n🔗 [${offer.id}] Testando: ${url}`);
     try {
       await page.goto(url, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT });
       await page.waitForTimeout(WAIT_TIME);
       const result = await attemptExtract(page);
 
       if (result.found) {
-        console.log(`✅ Encontrado: ${result.count} anúncios (seletor: ${result.selector})`);
+        console.log(`✅ [${offer.id}] ${result.count} anúncios encontrados (sel: ${result.selector})`);
+
+        const { error: updateError } = await supabase
+          .from("swipe_file_offers")
+          .update({
+            activeAds: result.count,
+            status_updated: "success",
+            attempts: 0,
+            updated_at: new Date().toISOString()
+          })
+          .eq("id", offer.id);
+
+        if (updateError) console.log(`⚠️ [${offer.id}] erro ao atualizar: ${updateError.message}`);
       } else {
-        console.log(`⚠️  Nenhum número encontrado — salvando HTML...`);
+        console.log(`⚠️ [${offer.id}] nenhum número encontrado`);
         const html = await page.content();
-        const file = path.join(DEBUG_DIR, `debug-${Date.now()}.html`);
-        await fs.promises.writeFile(file, html, "utf8");
-        console.log(`💾 HTML salvo em ${file}`);
+        await fs.promises.writeFile(`${DEBUG_DIR}/debug-${offer.id}.html`, html, "utf8");
       }
+
     } catch (e) {
-      console.log(`💥 Erro ao testar ${url}: ${e.message}`);
+      console.log(`💥 [${offer.id}] erro: ${e.message}`);
     }
   }
 
   await browser.close();
-  console.log("\n✅ Teste manual finalizado.");
+  console.log("\n✅ Worker finalizado com sucesso.");
 })();
